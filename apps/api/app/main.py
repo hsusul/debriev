@@ -10,6 +10,7 @@ from debriev_core.stubs import extract_citations
 from debriev_core.types import DebrievReport
 from debriev_core.verify import verify_case_citation
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -129,6 +130,19 @@ def list_documents(session: Session = Depends(get_session)) -> list[DocumentResp
         DocumentResponse(doc_id=row.doc_id, filename=row.filename, created_at=row.created_at)
         for row in rows
     ]
+
+
+@app.get("/v1/documents/{doc_id}/pdf")
+def get_document_pdf(doc_id: UUID, session: Session = Depends(get_session)) -> FileResponse:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    file_path = Path(document.file_path)
+    if not file_path.is_file() or file_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    return FileResponse(str(file_path), media_type="application/pdf", filename=document.filename)
 
 
 @app.get("/v1/citations/{doc_id}", response_model=list[CitationResponse])

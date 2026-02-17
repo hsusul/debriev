@@ -5,12 +5,11 @@ Debriev is a monorepo scaffold for legal citation integrity reporting.
 ## v1 Scope
 - US case citations only (`U.S.`, `F.2d`/`F.3d`, `F. Supp.`, `S. Ct.`, `L. Ed.`).
 - No statutes, regulations, or Bluebook edge cases in v1.
-- Verification remains stubbed.
 
-## Implemented in Task 2
-- PDF text extraction via PyMuPDF.
-- Regex-based US case citation extraction in `packages/core`.
-- API upload flow now stores extracted citation spans and returns a report containing citations.
+## Implemented
+- Task 2: PDF text extraction + regex-based citation extraction in `packages/core`.
+- Day 3: CourtListener-backed verification for `U.S.` citations.
+- Day 3 UI: report page renders source PDF and highlights extracted citations.
 
 ## Run with Docker Compose
 ```bash
@@ -22,16 +21,22 @@ Services:
 - API: `localhost:8000`
 - Web: `localhost:3000`
 
-## Demo Task 2
+## Smoke Test
 1. Open `http://localhost:3000/upload`.
-2. Upload a PDF containing US case citations (for example: `410 U.S. 113`, `123 F.3d 456`).
-3. After redirect, inspect `/reports/{doc_id}` JSON and confirm extracted citation entries.
-4. Optionally open `http://localhost:3000/documents` to list uploaded documents.
+2. Upload a PDF containing case citations.
+3. Open `/reports/{doc_id}` and confirm:
+   - PDF renders in the center panel.
+   - Citation list appears on the right panel.
+   - Clicking a citation jumps to the matched page and highlights text.
+   - Verify button updates statuses and links.
 
 ## API Endpoints
 - `GET /health`
 - `POST /v1/upload` (multipart field `file`, only `.pdf`)
 - `GET /v1/documents`
+- `GET /v1/documents/{doc_id}/pdf`
+- `GET /v1/citations/{doc_id}`
+- `POST /v1/verify/{doc_id}`
 - `GET /v1/reports/{doc_id}`
 
 ## Local Core Tests
