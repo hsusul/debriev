@@ -2,12 +2,17 @@ import VerifyButton from "./VerifyButton";
 
 const API_BASE = process.env.API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "http://api:8000";
 
+type VerificationDetails = {
+  courtlistener_url?: string;
+};
+
 type ReportCitation = {
   raw: string;
   start?: number | null;
   end?: number | null;
   context_text?: string | null;
   verification_status?: string | null;
+  verification_details?: VerificationDetails | null;
 };
 
 type ReportPayload = {
@@ -36,6 +41,28 @@ function truncateContext(value: string | null | undefined): string {
   return `${value.slice(0, 140)}...`;
 }
 
+function buildCounts(citations: ReportCitation[]) {
+  let verified = 0;
+  let notFound = 0;
+  let errors = 0;
+  let unverified = 0;
+
+  for (const citation of citations) {
+    const status = citation.verification_status || "unverified";
+    if (status === "verified") {
+      verified += 1;
+    } else if (status === "not_found") {
+      notFound += 1;
+    } else if (status === "error") {
+      errors += 1;
+    } else {
+      unverified += 1;
+    }
+  }
+
+  return { verified, notFound, errors, unverified };
+}
+
 export default async function ReportPage({ params }: { params: { docId: string } }) {
   let report: ReportPayload | null = null;
   let error = "";
@@ -45,6 +72,8 @@ export default async function ReportPage({ params }: { params: { docId: string }
   } catch (err) {
     error = err instanceof Error ? err.message : "Failed to load report";
   }
+
+  const counts = report ? buildCounts(report.citations) : null;
 
   return (
     <main>
@@ -60,6 +89,13 @@ export default async function ReportPage({ params }: { params: { docId: string }
             <strong>Overall Score:</strong> {report.overall_score}
           </p>
 
+          {counts ? (
+            <p>
+              <strong>Counts:</strong> Verified {counts.verified} / Not found {counts.notFound} / Errors {counts.errors} /
+              Unverified {counts.unverified}
+            </p>
+          ) : null}
+
           <h3>Citations</h3>
           {report.citations.length === 0 ? (
             <p>No citations found for this document.</p>
@@ -70,6 +106,7 @@ export default async function ReportPage({ params }: { params: { docId: string }
                   <th style={{ textAlign: "left", borderBottom: "1px solid #ddd", padding: "8px" }}>Raw</th>
                   <th style={{ textAlign: "left", borderBottom: "1px solid #ddd", padding: "8px" }}>Context</th>
                   <th style={{ textAlign: "left", borderBottom: "1px solid #ddd", padding: "8px" }}>Status</th>
+                  <th style={{ textAlign: "left", borderBottom: "1px solid #ddd", padding: "8px" }}>Link</th>
                 </tr>
               </thead>
               <tbody>
@@ -83,6 +120,15 @@ export default async function ReportPage({ params }: { params: { docId: string }
                     </td>
                     <td style={{ borderBottom: "1px solid #f0f0f0", padding: "8px", verticalAlign: "top" }}>
                       {citation.verification_status || "unverified"}
+                    </td>
+                    <td style={{ borderBottom: "1px solid #f0f0f0", padding: "8px", verticalAlign: "top" }}>
+                      {citation.verification_details?.courtlistener_url ? (
+                        <a href={citation.verification_details.courtlistener_url} target="_blank" rel="noopener">
+                          Open
+                        </a>
+                      ) : (
+                        "-"
+                      )}
                     </td>
                   </tr>
                 ))}

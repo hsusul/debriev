@@ -8,6 +8,7 @@ from uuid import UUID
 from debriev_core.ingest.pdf_text import extract_pdf_text
 from debriev_core.stubs import extract_citations
 from debriev_core.types import DebrievReport
+from debriev_core.verify import verify_case_citation
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlmodel import Session, select
@@ -163,13 +164,51 @@ def verify_report(doc_id: UUID, session: Session = Depends(get_session)) -> dict
     ).all()
 
     report_json = dict(report.report_json)
-    citations_payload = report_json.get("citations")
-    if isinstance(citations_payload, list):
-        for entry in citations_payload:
-            if isinstance(entry, dict):
-                entry["verification_status"] = "unverified"
+    citations_payload_raw = report_json.get("citations")
+    citations_payload: list[dict[str, Any]] = (
+        [entry for entry in citations_payload_raw if isinstance(entry, dict)]
+        if isinstance(citations_payload_raw, list)
+        else []
+    )
 
-    report_json["summary"] = f"Verified {len(citation_rows)} citation(s) (stub)."
+    verified_count = 0
+    not_found_count = 0
+    error_count = 0
+    unverified_count = 0
+
+    for idx, citation_row in enumerate(citation_rows):
+        result = verify_case_citation(citation_row.raw)
+        if result.status == "verified":
+            verified_count += 1
+        elif result.status == "not_found":
+            not_found_count += 1
+        elif result.status == "error":
+            error_count += 1
+        else:
+            unverified_count += 1
+
+        if idx < len(citations_payload):
+            citation_entry = citations_payload[idx]
+        else:
+            citation_entry = {
+                "raw": citation_row.raw,
+                "start": citation_row.start,
+                "end": citation_row.end,
+                "context_text": citation_row.context_text,
+            }
+            citations_payload.append(citation_entry)
+
+        citation_entry["verification_status"] = result.status
+        citation_entry["verification_details"] = result.details or {}
+
+    total = len(citation_rows)
+    overall_score = int((verified_count * 100) / total) if total > 0 else 0
+    report_json["citations"] = citations_payload
+    report_json["summary"] = (
+        f"Verified {verified_count} / {total} citations "
+        f"({not_found_count} not found, {error_count} errors)."
+    )
+    report_json["overall_score"] = overall_score
     report.report_json = report_json
 
     session.add(report)
