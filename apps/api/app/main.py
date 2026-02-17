@@ -28,6 +28,17 @@ class DocumentResponse(BaseModel):
     created_at: datetime
 
 
+class CitationResponse(BaseModel):
+    id: int
+    doc_id: UUID
+    raw: str
+    normalized: str | None
+    start: int | None
+    end: int | None
+    context_text: str | None
+    created_at: datetime
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
@@ -117,6 +128,55 @@ def list_documents(session: Session = Depends(get_session)) -> list[DocumentResp
         DocumentResponse(doc_id=row.doc_id, filename=row.filename, created_at=row.created_at)
         for row in rows
     ]
+
+
+@app.get("/v1/citations/{doc_id}", response_model=list[CitationResponse])
+def list_citations(doc_id: UUID, session: Session = Depends(get_session)) -> list[CitationResponse]:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    rows = session.exec(select(Citation).where(Citation.doc_id == doc_id).order_by(Citation.id)).all()
+    return [
+        CitationResponse(
+            id=row.id if row.id is not None else 0,
+            doc_id=row.doc_id,
+            raw=row.raw,
+            normalized=row.normalized,
+            start=row.start,
+            end=row.end,
+            context_text=row.context_text,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+
+@app.post("/v1/verify/{doc_id}")
+def verify_report(doc_id: UUID, session: Session = Depends(get_session)) -> dict[str, Any]:
+    report = session.exec(select(Report).where(Report.doc_id == doc_id)).first()
+    if report is None:
+        raise HTTPException(status_code=404, detail="Report not found")
+
+    citation_rows = session.exec(
+        select(Citation).where(Citation.doc_id == doc_id).order_by(Citation.id)
+    ).all()
+
+    report_json = dict(report.report_json)
+    citations_payload = report_json.get("citations")
+    if isinstance(citations_payload, list):
+        for entry in citations_payload:
+            if isinstance(entry, dict):
+                entry["verification_status"] = "unverified"
+
+    report_json["summary"] = f"Verified {len(citation_rows)} citation(s) (stub)."
+    report.report_json = report_json
+
+    session.add(report)
+    session.commit()
+    session.refresh(report)
+
+    return DebrievReport.model_validate(report.report_json).model_dump()
 
 
 @app.get("/v1/reports/{doc_id}")
