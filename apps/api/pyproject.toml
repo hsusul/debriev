@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "debriev-api"
+version = "0.1.0"
+description = "Debriev API"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1.0",
+  "uvicorn>=0.30,<1.0",
+  "sqlmodel>=0.0.22,<1.0",
+  "psycopg[binary]>=3.2,<4.0",
+  "python-multipart>=0.0.9,<1.0",
+  "pydantic-settings>=2.2,<3.0",
+  "debriev-core"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
