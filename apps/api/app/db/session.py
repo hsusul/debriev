@@ -1,6 +1,23 @@
 from __future__ import annotations
 
-from sqlmodel import Session, SQLModel, create_engine
+from typing import Any
+
+try:
+    from sqlmodel import Session, SQLModel, create_engine
+except ModuleNotFoundError:  # pragma: no cover - allows extractor self-tests without db deps
+    class _DummyMetadata:
+        def create_all(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+    class SQLModel:
+        metadata = _DummyMetadata()
+
+    class Session:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise ModuleNotFoundError("sqlmodel is required for database-backed API routes")
+
+    def create_engine(*args: Any, **kwargs: Any) -> None:  # type: ignore[no-redef]
+        return None
 
 from app.settings import settings
 

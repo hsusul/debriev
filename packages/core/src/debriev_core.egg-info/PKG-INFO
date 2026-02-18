@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: debriev-core
+Version: 0.1.0
+Summary: Debriev core contracts and domain stubs
+Requires-Python: >=3.11
+Requires-Dist: pydantic<3.0,>=2.6
+Requires-Dist: pymupdf<2.0,>=1.24
+Requires-Dist: requests<3.0,>=2.31
+Provides-Extra: test
+Requires-Dist: pytest>=8.0; extra == "test"

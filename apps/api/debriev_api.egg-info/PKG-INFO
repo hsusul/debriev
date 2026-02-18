@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: debriev-api
+Version: 0.1.0
+Summary: Debriev API
+Requires-Python: >=3.11
+Requires-Dist: fastapi<1.0,>=0.115
+Requires-Dist: uvicorn<1.0,>=0.30
+Requires-Dist: sqlmodel<1.0,>=0.0.22
+Requires-Dist: psycopg[binary]<4.0,>=3.2
+Requires-Dist: python-multipart<1.0,>=0.0.9
+Requires-Dist: pydantic-settings<3.0,>=2.2
+Requires-Dist: debriev-core

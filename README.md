@@ -38,6 +38,7 @@ Services:
 - `GET /v1/citations/{doc_id}`
 - `POST /v1/verify/{doc_id}`
 - `GET /v1/reports/{doc_id}`
+- `POST /v1/retrieval/query`
 
 ## Local Core Tests
 ```bash
@@ -51,7 +52,29 @@ pytest packages/core/tests
 API:
 - `DATABASE_URL` (default `postgresql+psycopg://debriev:debrievdev@postgres:5432/debriev`)
 - `STORAGE_DIR` (default `/tmp/debriev_uploads`)
+- `RETRIEVAL_DB_PATH` (default `./data/retrieval.db`)
+- `EMBED_PROVIDER` (`stub` or `openai`, default `stub`)
+- `OPENAI_API_KEY` (required when `EMBED_PROVIDER=openai`)
 
 Web:
 - `NEXT_PUBLIC_API_BASE_URL` (default `http://localhost:8000`)
 - `API_BASE_URL` (default `http://api:8000`)
+
+## Indexing & Retrieval (MVP)
+The retrieval MVP stores chunk text and embeddings in SQLite, then does cosine similarity search.
+
+1. Index a document:
+```bash
+python scripts/index_doc.py --doc-id <doc_uuid>
+```
+
+2. Query indexed chunks:
+```bash
+curl -s -X POST http://localhost:8000/v1/retrieval/query \
+  -H "Content-Type: application/json" \
+  -d '{"doc_id":"<doc_uuid>","query":"What does this document say about jurisdiction?","k":3}'
+```
+
+Notes:
+- If `OPENAI_API_KEY` is not set, embeddings default to deterministic stub vectors.
+- If `EMBED_PROVIDER=openai` and key is set, OpenAI embeddings are used.

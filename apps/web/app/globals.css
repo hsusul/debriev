@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 2 6 23;
+  --panel: 15 23 42;
+  --border: 51 65 85;
+  --text: 226 232 240;
+}
+
+html, body { height: 100%; }
+
+body { @apply bg-slate-950 text-slate-100 antialiased; }
+
+a { @apply text-slate-100 transition-colors hover:text-blue-300; }

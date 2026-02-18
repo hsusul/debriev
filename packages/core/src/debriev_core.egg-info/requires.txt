@@ -1,0 +1,6 @@
+pydantic<3.0,>=2.6
+pymupdf<2.0,>=1.24
+requests<3.0,>=2.31
+
+[test]
+pytest>=8.0

@@ -32,11 +32,18 @@ export default function VerifyButton({ docId }: { docId: string }) {
   };
 
   return (
-    <div style={{ marginBottom: "12px" }}>
-      <button type="button" onClick={onVerify} disabled={loading}>
+    <div className="mb-3">
+      <button
+        type="button"
+        onClick={onVerify}
+        disabled={loading}
+        className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+      >
         {loading ? "Verifying..." : "Verify (stub)"}
       </button>
-      {error ? <p style={{ color: "crimson", marginTop: "8px" }}>{error}</p> : null}
+      {error ? (
+        <p className="mt-2 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">{error}</p>
+      ) : null}
     </div>
   );
 }
