@@ -1,0 +1,7 @@
+fastapi<1.0,>=0.115
+uvicorn<1.0,>=0.30
+sqlmodel<1.0,>=0.0.22
+psycopg[binary]<4.0,>=3.2
+python-multipart<1.0,>=0.0.9
+pydantic-settings<3.0,>=2.2
+debriev-core

@@ -1,6 +1,7 @@
 import "react-pdf/dist/Page/AnnotationLayer.css";
 import "react-pdf/dist/Page/TextLayer.css";
 
+import ChatPanel from "../../components/ChatPanel";
 import ReportWorkspace from "./ReportWorkspace";
 
 const API_BASE = process.env.API_BASE_URL || process.env.NEXT_PUBLIC_API_BASE_URL || "http://api:8000";
@@ -45,10 +46,17 @@ export default async function ReportPage({ params }: { params: { docId: string }
   }
 
   return (
-    <main>
-      <h2>Report {params.docId}</h2>
-      {error ? <p style={{ color: "crimson" }}>{error}</p> : null}
+    <section className="mx-auto w-full max-w-[1400px] space-y-5">
+      <div className="rounded-2xl border border-slate-700/70 bg-slate-900/70 px-5 py-4">
+        <h2 className="text-xl font-semibold text-slate-100">Report {params.docId}</h2>
+        <p className="mt-1 text-sm text-slate-400">Review citations, verification status, and source context.</p>
+        {error ? (
+          <p className="mt-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">{error}</p>
+        ) : null}
+      </div>
+
       {report ? <ReportWorkspace docId={params.docId} report={report} /> : null}
-    </main>
+      <ChatPanel docId={params.docId} introText="Ask about this report. I will answer from indexed chunks." />
+    </section>
   );
 }

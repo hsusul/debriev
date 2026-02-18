@@ -5,11 +5,33 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from sqlalchemy import JSON, Column, String
-from sqlmodel import Field, SQLModel
+try:
+    from sqlmodel import Field, SQLModel
+except ModuleNotFoundError:  # pragma: no cover - allows extractor self-tests without db deps
+    class SQLModel:
+        def __init_subclass__(cls, **kwargs: Any) -> None:
+            super().__init_subclass__()
+
+    def Field(
+        default: Any = None,
+        *,
+        default_factory: Any = None,
+        **kwargs: Any,
+    ) -> Any:
+        if default_factory is not None:
+            return default_factory()
+        return default
+
+
+class Project(SQLModel, table=True):
+    project_id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
+    name: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
 class Document(SQLModel, table=True):
     doc_id: UUID = Field(default_factory=uuid4, primary_key=True, index=True)
+    project_id: UUID | None = Field(default=None, foreign_key="project.project_id", index=True)
     filename: str
     file_path: str
     stub_text: str
