@@ -461,29 +461,26 @@ def _case_key(name: str) -> str:
 
 
 def _case_mentioned_in_comparator_context(text: str, case_name: str) -> bool:
-    """
-    True if the case appears in a comparator sentence like:
-    'the case ... is titled <CASE>' / 'captioned <CASE>' etc.
-    Only checks the *sentence* that contains the case name to avoid
-    false positives across wrapped bullets.
-    """
-    flat = _normalize_ws(text)
-    name_norm = _normalize_ws(case_name)
-
-    # split into rough sentences; reuse your splitter if you want
-    for sent in _split_context_sentences(flat):
-        if name_norm.lower() not in sent.lower():
+    normalized = _normalize_ws(text)
+    target_key = _case_key(case_name)
+    for sentence in _split_context_sentences(normalized):
+        sent_lower = sentence.lower()
+        matching_mentions = [
+            mention for mention in _extract_case_mentions(sentence) if _case_key(mention) == target_key
+        ]
+        if not matching_mentions:
             continue
-        sent_norm = _normalize_ws(sent)
-        escaped = re.escape(name_norm)
 
-        for pivot in _COMPARATOR_PIVOT_PHRASES:
-            pivot_re = re.escape(pivot)
-            # pivot must be in same sentence before the case name
-            pattern = re.compile(rf"(?i)\b{pivot_re}\b[\s\S]{{0,200}}{escaped}\b")
-            if pattern.search(sent_norm):
+        pivot_positions = [sent_lower.find(p) for p in _COMPARATOR_PIVOT_PHRASES]
+        pivot_positions = [i for i in pivot_positions if i >= 0]
+        if not pivot_positions:
+            continue
+        pivot_pos = min(pivot_positions)
+
+        for mention in matching_mentions:
+            mention_pos = sent_lower.find(_normalize_ws(mention).lower())
+            if mention_pos >= 0 and pivot_pos < mention_pos:
                 return True
-
     return False
 
 
@@ -694,6 +691,8 @@ def _split_context_sentences(text: str) -> list[str]:
         should_split = False
         if not next_char:
             should_split = True
+        elif next_char in {"•", "-", "*", "–", "—"}:
+            should_split = True
         elif next_char.isupper() and not is_abbreviation:
             should_split = True
 
@@ -719,6 +718,7 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
     results: list[str] = []
     recent_cases: list[str] = []
     recent_case_keys: list[str] = []
+    bogus_source_keys: set[str] = set()
     fake_list_case_keys: set[str] = set()
 
     def add_case_name(case_name: str) -> None:
@@ -729,7 +729,6 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
         results.append(case_name)
 
     def add_cases(text: str) -> None:
-        nonlocal results
         for case_name in _extract_case_mentions(text):
             add_case_name(case_name)
             if len(results) >= limit:
@@ -758,12 +757,44 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
                     add_case_name(case_name)
                     break
 
+    def add_cases_with_keys(text: str, key_set: set[str]) -> None:
+        for case_name in _extract_case_mentions(text):
+            add_case_name(case_name)
+            key_set.add(_case_key(case_name))
+            if len(results) >= limit:
+                return
+
+    def add_recent_party_link_cases_with_keys(text: str, key_set: set[str]) -> None:
+        if "no such case" not in text.lower():
+            return
+        for token in _extract_recent_party_tokens(text):
+            token_lower = token.lower()
+            for case_name in reversed(recent_cases):
+                if token_lower in case_name.lower():
+                    add_case_name(case_name)
+                    key_set.add(_case_key(case_name))
+                    break
+
+    def is_obvious_paragraph_break(text: str) -> bool:
+        return bool(
+            re.match(
+                r"^(?:Citation\s+\[\d+\]|The Court|At oral argument|Accordingly|Based on|In sum|In addition)\b",
+                text,
+                re.IGNORECASE,
+            )
+        )
+
+    def _explode_inline_bullets(text: str) -> list[str]:
+        exploded = text.replace("\r\n", "\n")
+        exploded = re.sub(r"\s+([•·\u2022])\s+", r"\n\1 ", exploded)
+        return exploded.splitlines()
+
     for chunk in chunks:
         chunk_text = str(chunk.get("text", "") or "")
         if not chunk_text:
             continue
 
-        lines = [line.strip() for line in chunk_text.splitlines()]
+        lines = [line.strip() for line in _explode_inline_bullets(chunk_text)]
         chunk_cases = _extract_case_mentions(chunk_text)
         chunk_has_bogus = _contains_any(chunk_text, _BOGUS_INDICATORS)
 
@@ -776,21 +807,38 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
                 for case_name in chunk_cases:
                     if "varghese v" in case_name.lower():
                         add_case_name(case_name)
+                        bogus_source_keys.add(_case_key(case_name))
                         if len(results) >= limit:
                             return results
 
         collecting_fake_list = False
         list_item_buf: str | None = None
+        fake_list_buf: str | None = None
 
-        def flush_list_item_buf(mark_fake_list: bool = False) -> None:
+        def flush_fake_list_buf() -> None:
+            nonlocal fake_list_buf
+            if not fake_list_buf:
+                return
+            lowered = fake_list_buf.lower()
+            for case_name in _extract_case_mentions(fake_list_buf):
+                mention_pos = lowered.find(_normalize_ws(case_name).lower())
+                if mention_pos >= 0:
+                    local_before = lowered[max(0, mention_pos - 24) : mention_pos]
+                    if re.search(r"(?:^|[;:,])\s*and\s*$", local_before):
+                        continue
+                before = len(results)
+                add_case_name(case_name)
+                if len(results) > before:
+                    fake_list_case_keys.add(_case_key(case_name))
+                if len(results) >= limit:
+                    break
+            fake_list_buf = None
+
+        def flush_list_item_buf() -> None:
             nonlocal list_item_buf
-            if list_item_buf:
-                source_text = _split_before_comparator(list_item_buf) if mark_fake_list else list_item_buf
-                extracted = _extract_case_mentions(source_text)
-                for case_name in extracted:
-                    add_case_name(case_name)
-                    if mark_fake_list:
-                        fake_list_case_keys.add(_case_key(case_name))
+            if not list_item_buf:
+                return
+            add_cases_with_keys(_split_before_comparator(list_item_buf), fake_list_case_keys)
             list_item_buf = None
 
         for line in lines:
@@ -799,6 +847,7 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
 
             if not line:
                 flush_list_item_buf()
+                flush_fake_list_buf()
                 collecting_fake_list = False
                 continue
 
@@ -806,71 +855,76 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
             is_bogus_line = _contains_any(line, _BOGUS_INDICATORS)
             is_comparator_line = _contains_any(line, _COMPARATOR_INDICATORS)
             starts_fake_list = (
-                re.search(r"\b(?:also\s+)?appear to be fake as well\b:?", line, re.IGNORECASE)
-                is not None
+                re.search(r"\b(?:also\s+)?appear to be fake as well\b:?", line, re.IGNORECASE) is not None
+                or _contains_any(line, _FAKE_LIST_INDICATORS)
             )
             is_list_item = _is_list_item_line(line)
             is_strict_comparator_line = _is_strict_comparator_line(line)
 
             if starts_fake_list:
-                flush_list_item_buf(mark_fake_list=True)
+                flush_list_item_buf()
+                flush_fake_list_buf()
                 collecting_fake_list = True
+                fake_list_buf = line
+                if line.endswith("."):
+                    flush_fake_list_buf()
+                    collecting_fake_list = False
                 continue
 
             if collecting_fake_list:
-                if is_list_item and "comparator" in line.lower():
-                    flush_list_item_buf(mark_fake_list=True)
+                if is_strict_comparator_line or is_obvious_paragraph_break(line):
+                    flush_fake_list_buf()
+                    collecting_fake_list = False
                     continue
 
                 if is_list_item:
-                    flush_list_item_buf(mark_fake_list=True)
+                    flush_fake_list_buf()
+                    flush_list_item_buf()
                     list_item_buf = line
                     if line.endswith(".") or line.endswith(";"):
-                        flush_list_item_buf(mark_fake_list=True)
-                    continue
-
-                if is_bogus_line:
-                    add_cases(_split_before_comparator(line))
-                    add_cases_from_recent_party_link(_split_before_comparator(line))
+                        flush_list_item_buf()
                     continue
 
                 if list_item_buf is not None:
                     list_item_buf = _normalize_ws(f"{list_item_buf} {line}")
                     if line.endswith(".") or line.endswith(";"):
-                        flush_list_item_buf(mark_fake_list=True)
+                        flush_list_item_buf()
                     continue
 
-                if not is_list_item and line.endswith("."):
+                if fake_list_buf is None:
+                    fake_list_buf = line
+                else:
+                    fake_list_buf = _normalize_ws(f"{fake_list_buf} {line}")
+                if line.endswith("."):
+                    flush_fake_list_buf()
                     collecting_fake_list = False
                 continue
 
             if is_bogus_line:
                 bogus_part = _split_before_comparator(line)
-                add_cases(bogus_part)
-                add_cases_from_recent_party_link(bogus_part)
+                add_cases_with_keys(bogus_part, bogus_source_keys)
+                add_recent_party_link_cases_with_keys(bogus_part, bogus_source_keys)
                 continue
 
             if is_strict_comparator_line or is_comparator_line:
                 continue
 
-        flush_list_item_buf(mark_fake_list=True)
+        flush_list_item_buf()
+        flush_fake_list_buf()
 
-
-
-
-        sentences = _split_context_sentences(chunk_text)
-        for sentence in sentences:
+        for sentence in _split_context_sentences(chunk_text):
             if len(results) >= limit:
                 return results
             cache_recent_cases(sentence)
-            is_bogus_sentence = _contains_any(sentence, _BOGUS_INDICATORS)
-            if not is_bogus_sentence:
+            if not _contains_any(sentence, _BOGUS_INDICATORS):
                 continue
+
             extractable_sentence = _split_before_comparator(sentence)
-            add_cases(extractable_sentence)
-            add_cases_from_recent_party_link(extractable_sentence)
-    # --- final cleanup pass ---
-    # 1) drop comparator/real cases
+            add_cases_with_keys(extractable_sentence, bogus_source_keys)
+            add_recent_party_link_cases_with_keys(extractable_sentence, bogus_source_keys)
+
+    allowed_keys = bogus_source_keys | fake_list_case_keys
+    results = [c for c in results if _case_key(c) in allowed_keys]
     combined_text = "\n".join(str(chunk.get("text", "") or "") for chunk in chunks)
     results = [
         c
@@ -878,10 +932,7 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
         if _case_key(c) in fake_list_case_keys
         or not _case_mentioned_in_comparator_context(combined_text, c)
     ]
-
-    # 2) dedup truncated prefixes (e.g., 'Zicherman v Korean' vs full)
     results = _dedup_prefix_cases(results)
-
     return results
 
 
@@ -943,14 +994,12 @@ def _run_bogus_extractor_self_test() -> None:
     There has been no such case and no party named Varghese.
     Citation [27] references Zicherman v Korean Airlines Co., Ltd., 516 F. Supp. 2d 1277 (N.D. Ga. 2008), which does not appear to exist. The case appearing at that citation is Gibbs v. Maxwell House.
     Citation [31] references Zaunbrecher v. Transocean Offshore Deepwater Drilling, Inc., 898 F.3d 211 (5th Cir. 2018), which does not appear to exist.
-    Citation [34] references Shaboon v. Egyptair, 2013 WL 12131316 (S.D. Fla. Sept. 18, 2013), a bogus judicial decision.
-    Citation [35] references Petersen v. Iran Air, 905 F. Supp. 2d 121 (D.D.C. 2012), which is bogus.
-    Citation [36] references Martinez v. Delta Airlines, Inc., 2019 WL 1234567 (S.D. Fla. 2019), a non-existent decision.
-    Citation [40] references Miller v. United Airlines, Inc., 174 F.3d 366 (5th Cir. 1999), a real case.
-    The following five decisions from Federal Reporter, Third, also appear to be fake as well:
     - Holliday v. Atl. Capital Corp., which does not appear to exist. The case found at that citation is A.D. v Azar.
     - Hyatt v. N. Cent. Airlines, which does not appear to exist. Docket number 123 is for a case captioned George Cornea v. U.S. Attorney General.
-    - Estate of Durden v. KLM Royal Dutch Airlines.
+    The following five decisions from Federal Reporter, Third, also appear to be fake as well: Shaboon v. Egyptair, 2013 WL 12131316 (S.D. Fla. Sept. 18, 2013); Petersen v. Iran Air, 905 F. Supp. 2d 121 (D.D.C. 2012);
+    Martinez v. Delta Airlines, Inc., 2019 WL 1234567 (S.D. Fla. 2019); Estate of Durden v. KLM Royal Dutch Airlines, 2021 WL 1111111 (S.D.N.Y. 2021); and Miller v. United Airlines, Inc., 174 F.3d 366 (5th Cir. 1999).
+    Collapsed bullets from OCR: • Holliday v. Atl. Capital Corp., which does not appear to exist. The case found at that citation is A.D. v Azar. • Hyatt v. N. Cent. Airlines, which does not appear to exist. Docket number 123 is for a case captioned George Cornea v. U.S. Attorney General. • Estate of Durden v. KLM Royal Dutch Airlines, which appears to be fake as well.
+    The case appearing at that citation is titled Witt v. Metropolitan Life Ins. Co. The case found at that citation is Miller v. United Airlines, Inc.
     - Witt v. Metropolitan Life Ins. Co. is titled in a comparator sentence.
     Citation [30] references Gibbs v. Maxwell House, a real case.
     """
