@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 import re
@@ -518,6 +519,18 @@ _BOGUS_INDICATORS = (
     "copies of non-existent",
     "bogus judicial decisions",
 )
+_BOGUS_REASON_PHRASES = (
+    "does not appear to exist",
+    "non-existent",
+    "nonexistent",
+    "no such case",
+    "there has been no such case",
+    "bogus judicial decisions",
+    "appear to be fake",
+    "fake as well",
+    "bogus",
+    "fake",
+)
 
 _COMPARATOR_INDICATORS = (
     "the case appearing at that citation is",
@@ -936,6 +949,130 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
     return results
 
 
+@dataclass(frozen=True)
+class BogusCaseFinding:
+    case_name: str
+    reason: str
+    evidence: str
+    doc_id: str | None = None
+    chunk_id: str | None = None
+
+
+def _first_bogus_reason(text: str) -> str | None:
+    lowered = text.lower()
+    for phrase in _BOGUS_REASON_PHRASES:
+        if phrase in lowered:
+            return phrase
+    return None
+
+
+def _extract_bogus_case_findings(
+    chunks: list[dict[str, object]],
+    limit: int = 20,
+) -> list[BogusCaseFinding]:
+    allowed_cases = _extract_bogus_case_list(chunks, limit=max(limit, 20))
+    if not allowed_cases:
+        return []
+
+    allowed_by_key = {_case_key(case_name): case_name for case_name in allowed_cases}
+    findings: list[BogusCaseFinding] = []
+    seen_keys: set[str] = set()
+
+    def add_finding(
+        *,
+        case_key: str,
+        reason: str,
+        evidence: str,
+        doc_id: str | None,
+        chunk_id: str | None,
+    ) -> None:
+        if case_key in seen_keys:
+            return
+        seen_keys.add(case_key)
+        findings.append(
+            BogusCaseFinding(
+                case_name=allowed_by_key[case_key],
+                reason=reason,
+                evidence=evidence,
+                doc_id=doc_id,
+                chunk_id=chunk_id,
+            )
+        )
+
+    for chunk in chunks:
+        chunk_text = str(chunk.get("text", "") or "")
+        if not chunk_text:
+            continue
+
+        doc_id_raw = chunk.get("doc_id")
+        chunk_id_raw = chunk.get("chunk_id")
+        doc_id = str(doc_id_raw) if doc_id_raw is not None else None
+        chunk_id = str(chunk_id_raw) if chunk_id_raw is not None else None
+
+        for sentence in _split_context_sentences(chunk_text):
+            evidence = _normalize_ws(sentence)
+            if not evidence:
+                continue
+
+            reason = _first_bogus_reason(evidence)
+            if reason is None:
+                continue
+
+            for case_name in _extract_case_mentions(evidence):
+                key = _case_key(case_name)
+                if key not in allowed_by_key or key in seen_keys:
+                    continue
+
+                add_finding(
+                    case_key=key,
+                    reason=reason,
+                    evidence=evidence,
+                    doc_id=doc_id,
+                    chunk_id=chunk_id,
+                )
+                if len(findings) >= limit:
+                    return findings
+
+        lines = [line.strip() for line in chunk_text.splitlines() if line.strip()]
+        for idx, line in enumerate(lines):
+            if len(findings) >= limit:
+                return findings
+
+            line_text = _normalize_ws(line)
+            mentions = _extract_case_mentions(line_text)
+            if not mentions:
+                continue
+
+            reason = _first_bogus_reason(line_text)
+            evidence = line_text
+            if reason is None:
+                for prev_idx in range(idx - 1, max(-1, idx - 4), -1):
+                    prev_line = _normalize_ws(lines[prev_idx])
+                    prev_reason = _first_bogus_reason(prev_line)
+                    if prev_reason is None:
+                        continue
+                    reason = prev_reason
+                    evidence = _normalize_ws(f"{prev_line} {line_text}")
+                    break
+
+            if reason is None:
+                continue
+
+            for case_name in mentions:
+                key = _case_key(case_name)
+                if key not in allowed_by_key or key in seen_keys:
+                    continue
+                add_finding(
+                    case_key=key,
+                    reason=reason,
+                    evidence=evidence,
+                    doc_id=doc_id,
+                    chunk_id=chunk_id,
+                )
+
+    return findings
+
+
 
 def _summary_from_chunks(chunks: list[dict[str, object]]) -> str:
     texts = [_normalize_ws(str(chunk.get("text", "") or "")) for chunk in chunks[:2]]
@@ -980,9 +1117,15 @@ def _simple_answer_from_chunks(message: str, chunks: list[dict[str, object]]) ->
     list_keywords = ("bogus", "non-existent", "nonexistent", "fake")
     lowered = message.lower()
     if any(keyword in lowered for keyword in list_keywords):
-        cases = _extract_bogus_case_list(chunks)
-        if cases:
-            bullets = "\n".join(f"- {case_name}" for case_name in cases)
+        findings = _extract_bogus_case_findings(chunks)
+        if findings:
+            bullets = "\n".join(
+                [
+                    f"- {finding.case_name} — {finding.reason} (source: {finding.chunk_id or finding.doc_id or 'unknown'})\n"
+                    f"  Evidence: {finding.evidence}"
+                    for finding in findings
+                ]
+            )
             return f"Bogus/non-existent cases found:\n{bullets}"
 
     return _summary_from_chunks(chunks)
@@ -1033,6 +1176,14 @@ def _run_bogus_extractor_self_test() -> None:
     for case_name in expected_excludes:
         assert case_name not in found_set, f"Unexpected comparator/real case included: {case_name}"
     assert not any(item.lower().startswith("circuit,") for item in found), "Unexpected Circuit-prefixed case entry"
+
+    findings = _extract_bogus_case_findings([{"text": sample, "chunk_id": "chunk:self-test"}])
+    finding_keys = {_case_key(item.case_name) for item in findings}
+    for case_name in expected_includes:
+        assert case_name in finding_keys, f"Expected finding missing: {case_name}"
+    for finding in findings:
+        assert finding.reason.strip(), f"Missing reason for finding: {finding.case_name}"
+        assert finding.evidence.strip(), f"Missing evidence for finding: {finding.case_name}"
 
 
 @app.post("/v1/retrieval/index", response_model=RetrievalIndexResponse)
