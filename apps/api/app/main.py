@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 try:
     from sqlmodel import Session, select
@@ -1030,8 +1030,6 @@ class BogusCaseFinding:
     case_name: str
     reason_label: str
     reason_phrase: str
-    reason_label: str
-    reason_phrase: str
     evidence: str
     doc_id: str | None = None
     chunk_id: str | None = None
@@ -1059,20 +1057,6 @@ def _first_bogus_reason(text: str) -> tuple[str, str] | None:
     return None
 
 
-def _format_finding_evidence(evidence: str, reason_phrase: str, max_len: int = 240) -> str:
-    normalized = _normalize_ws(evidence)
-    if not normalized:
-        return normalized
-
-    if reason_phrase and reason_phrase not in normalized.lower():
-        normalized = f"{reason_phrase}: {normalized}"
-
-    if len(normalized) <= max_len:
-        return normalized
-
-    return f"{normalized[: max_len - 3].rstrip()}..."
-
-
 def _extract_bogus_case_findings(
     chunks: list[dict[str, object]],
     limit: int = 20,
@@ -1088,8 +1072,6 @@ def _extract_bogus_case_findings(
     def add_finding(
         *,
         case_key: str,
-        reason_label: str,
-        reason_phrase: str,
         reason_label: str,
         reason_phrase: str,
         evidence: str,
@@ -1127,10 +1109,7 @@ def _extract_bogus_case_findings(
 
             reason_info = _first_bogus_reason(evidence)
             if reason_info is None:
-            reason_info = _first_bogus_reason(evidence)
-            if reason_info is None:
                 continue
-            reason_label, reason_phrase = reason_info
             reason_label, reason_phrase = reason_info
 
             extractable = _split_before_comparator(evidence)
@@ -1141,8 +1120,6 @@ def _extract_bogus_case_findings(
 
                 add_finding(
                     case_key=key,
-                    reason_label=reason_label,
-                    reason_phrase=reason_phrase,
                     reason_label=reason_label,
                     reason_phrase=reason_phrase,
                     evidence=evidence,
@@ -1163,26 +1140,19 @@ def _extract_bogus_case_findings(
                 continue
 
             reason_info = _first_bogus_reason(line_text)
-            reason_info = _first_bogus_reason(line_text)
             evidence = line_text
-            if reason_info is None:
             if reason_info is None:
                 for prev_idx in range(idx - 1, max(-1, idx - 4), -1):
                     prev_line = _normalize_ws(lines[prev_idx])
                     prev_reason_info = _first_bogus_reason(prev_line)
                     if prev_reason_info is None:
-                    prev_reason_info = _first_bogus_reason(prev_line)
-                    if prev_reason_info is None:
                         continue
-                    reason_info = prev_reason_info
                     reason_info = prev_reason_info
                     evidence = _normalize_ws(f"{prev_line} {line_text}")
                     break
 
             if reason_info is None:
-            if reason_info is None:
                 continue
-            reason_label, reason_phrase = reason_info
             reason_label, reason_phrase = reason_info
 
             extractable = _split_before_comparator(line_text)
@@ -1194,16 +1164,35 @@ def _extract_bogus_case_findings(
                     case_key=key,
                     reason_label=reason_label,
                     reason_phrase=reason_phrase,
-                    reason_label=reason_label,
-                    reason_phrase=reason_phrase,
                     evidence=evidence,
                     doc_id=doc_id,
                     chunk_id=chunk_id,
                 )
 
     findings.sort(key=lambda item: _case_key(item.case_name))
-    findings.sort(key=lambda item: _case_key(item.case_name))
     return findings
+
+
+_BOGUS_LIST_KEYWORDS = ("bogus", "non-existent", "nonexistent", "fake")
+
+
+def _is_bogus_case_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(keyword in lowered for keyword in _BOGUS_LIST_KEYWORDS)
+
+
+def _to_chat_findings(findings: list[BogusCaseFinding]) -> list[ChatFinding]:
+    return [
+        ChatFinding(
+            case_name=finding.case_name,
+            reason_label=finding.reason_label,
+            reason_phrase=finding.reason_phrase,
+            evidence=finding.evidence,
+            doc_id=finding.doc_id,
+            chunk_id=finding.chunk_id,
+        )
+        for finding in findings
+    ]
 
 
 def _summary_from_chunks(chunks: list[dict[str, object]]) -> str:
