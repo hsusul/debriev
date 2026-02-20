@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 try:
     from sqlmodel import Session, select
 except ModuleNotFoundError:  # pragma: no cover - allows extractor self-tests without db deps
@@ -120,9 +120,19 @@ class ChatSource(BaseModel):
     score: float
 
 
+class ChatFinding(BaseModel):
+    case_name: str
+    reason_label: str
+    reason_phrase: str
+    evidence: str
+    doc_id: str | None = None
+    chunk_id: str | None = None
+
+
 class ChatResponse(BaseModel):
     answer: str
     sources: list[ChatSource]
+    findings: list[ChatFinding] = Field(default_factory=list)
 
 
 class ProjectChatRequest(BaseModel):
@@ -530,6 +540,19 @@ _BOGUS_REASON_PHRASES = (
     "fake as well",
     "bogus",
     "fake",
+)
+_BOGUS_REASON_LABELS: tuple[tuple[str, str], ...] = (
+    ("does not appear to exist", "nonexistent_case"),
+    ("copies of non-existent", "nonexistent_case"),
+    ("non-existent", "nonexistent_case"),
+    ("nonexistent", "nonexistent_case"),
+    ("there has been no such case", "no_such_case"),
+    ("no such case", "no_such_case"),
+    ("appear to be fake", "appears_fake"),
+    ("fake as well", "appears_fake"),
+    ("bogus judicial decisions", "appears_fake"),
+    ("bogus", "appears_fake"),
+    ("fake", "appears_fake"),
 )
 
 _COMPARATOR_INDICATORS = (
@@ -952,18 +975,33 @@ def _extract_bogus_case_list(chunks: list[dict[str, object]], limit: int = 20) -
 @dataclass(frozen=True)
 class BogusCaseFinding:
     case_name: str
-    reason: str
+    reason_label: str
+    reason_phrase: str
     evidence: str
     doc_id: str | None = None
     chunk_id: str | None = None
 
 
-def _first_bogus_reason(text: str) -> str | None:
+def _first_bogus_reason(text: str) -> tuple[str, str] | None:
     lowered = text.lower()
-    for phrase in _BOGUS_REASON_PHRASES:
+    for phrase, label in _BOGUS_REASON_LABELS:
         if phrase in lowered:
-            return phrase
+            return label, phrase
     return None
+
+
+def _format_finding_evidence(evidence: str, reason_phrase: str, max_len: int = 240) -> str:
+    normalized = _normalize_ws(evidence)
+    if not normalized:
+        return normalized
+
+    if reason_phrase and reason_phrase not in normalized.lower():
+        normalized = f"{reason_phrase}: {normalized}"
+
+    if len(normalized) <= max_len:
+        return normalized
+
+    return f"{normalized[: max_len - 3].rstrip()}..."
 
 
 def _extract_bogus_case_findings(
@@ -981,7 +1019,8 @@ def _extract_bogus_case_findings(
     def add_finding(
         *,
         case_key: str,
-        reason: str,
+        reason_label: str,
+        reason_phrase: str,
         evidence: str,
         doc_id: str | None,
         chunk_id: str | None,
@@ -992,8 +1031,9 @@ def _extract_bogus_case_findings(
         findings.append(
             BogusCaseFinding(
                 case_name=allowed_by_key[case_key],
-                reason=reason,
-                evidence=evidence,
+                reason_label=reason_label,
+                reason_phrase=reason_phrase,
+                evidence=_format_finding_evidence(evidence, reason_phrase),
                 doc_id=doc_id,
                 chunk_id=chunk_id,
             )
@@ -1014,18 +1054,21 @@ def _extract_bogus_case_findings(
             if not evidence:
                 continue
 
-            reason = _first_bogus_reason(evidence)
-            if reason is None:
+            reason_info = _first_bogus_reason(evidence)
+            if reason_info is None:
                 continue
+            reason_label, reason_phrase = reason_info
 
-            for case_name in _extract_case_mentions(evidence):
+            extractable = _split_before_comparator(evidence)
+            for case_name in _extract_case_mentions(extractable):
                 key = _case_key(case_name)
                 if key not in allowed_by_key or key in seen_keys:
                     continue
 
                 add_finding(
                     case_key=key,
-                    reason=reason,
+                    reason_label=reason_label,
+                    reason_phrase=reason_phrase,
                     evidence=evidence,
                     doc_id=doc_id,
                     chunk_id=chunk_id,
@@ -1043,34 +1086,60 @@ def _extract_bogus_case_findings(
             if not mentions:
                 continue
 
-            reason = _first_bogus_reason(line_text)
+            reason_info = _first_bogus_reason(line_text)
             evidence = line_text
-            if reason is None:
+            if reason_info is None:
                 for prev_idx in range(idx - 1, max(-1, idx - 4), -1):
                     prev_line = _normalize_ws(lines[prev_idx])
-                    prev_reason = _first_bogus_reason(prev_line)
-                    if prev_reason is None:
+                    prev_reason_info = _first_bogus_reason(prev_line)
+                    if prev_reason_info is None:
                         continue
-                    reason = prev_reason
+                    reason_info = prev_reason_info
                     evidence = _normalize_ws(f"{prev_line} {line_text}")
                     break
 
-            if reason is None:
+            if reason_info is None:
                 continue
+            reason_label, reason_phrase = reason_info
 
-            for case_name in mentions:
+            extractable = _split_before_comparator(line_text)
+            for case_name in _extract_case_mentions(extractable):
                 key = _case_key(case_name)
                 if key not in allowed_by_key or key in seen_keys:
                     continue
                 add_finding(
                     case_key=key,
-                    reason=reason,
+                    reason_label=reason_label,
+                    reason_phrase=reason_phrase,
                     evidence=evidence,
                     doc_id=doc_id,
                     chunk_id=chunk_id,
                 )
 
+    findings.sort(key=lambda item: _case_key(item.case_name))
     return findings
+
+
+_BOGUS_LIST_KEYWORDS = ("bogus", "non-existent", "nonexistent", "fake")
+
+
+def _is_bogus_case_request(message: str) -> bool:
+    lowered = message.lower()
+    return any(keyword in lowered for keyword in _BOGUS_LIST_KEYWORDS)
+
+
+def _to_chat_findings(findings: list[BogusCaseFinding]) -> list[ChatFinding]:
+    return [
+        ChatFinding(
+            case_name=finding.case_name,
+            reason_label=finding.reason_label,
+            reason_phrase=finding.reason_phrase,
+            evidence=finding.evidence,
+            doc_id=finding.doc_id,
+            chunk_id=finding.chunk_id,
+        )
+        for finding in findings
+    ]
 
 
 
@@ -1114,14 +1183,12 @@ def _simple_answer_from_chunks(message: str, chunks: list[dict[str, object]]) ->
     if not chunks:
         return "I could not find relevant indexed context for that question yet."
 
-    list_keywords = ("bogus", "non-existent", "nonexistent", "fake")
-    lowered = message.lower()
-    if any(keyword in lowered for keyword in list_keywords):
+    if _is_bogus_case_request(message):
         findings = _extract_bogus_case_findings(chunks)
         if findings:
             bullets = "\n".join(
                 [
-                    f"- {finding.case_name} — {finding.reason} (source: {finding.chunk_id or finding.doc_id or 'unknown'})\n"
+                    f"- {finding.case_name} — {finding.reason_label} ({finding.reason_phrase}) (source: {finding.chunk_id or finding.doc_id or 'unknown'})\n"
                     f"  Evidence: {finding.evidence}"
                     for finding in findings
                 ]
@@ -1182,8 +1249,10 @@ def _run_bogus_extractor_self_test() -> None:
     for case_name in expected_includes:
         assert case_name in finding_keys, f"Expected finding missing: {case_name}"
     for finding in findings:
-        assert finding.reason.strip(), f"Missing reason for finding: {finding.case_name}"
+        assert finding.reason_label.strip(), f"Missing reason_label for finding: {finding.case_name}"
+        assert finding.reason_phrase.strip(), f"Missing reason_phrase for finding: {finding.case_name}"
         assert finding.evidence.strip(), f"Missing evidence for finding: {finding.case_name}"
+        assert len(finding.evidence) <= 240, f"Evidence too long for finding: {finding.case_name}"
 
 
 @app.post("/v1/retrieval/index", response_model=RetrievalIndexResponse)
@@ -1276,7 +1345,12 @@ def chat(
         for row in rows
     ]
     answer = _simple_answer_from_chunks(message, rows)
-    return ChatResponse(answer=answer, sources=sources)
+    findings = (
+        _to_chat_findings(_extract_bogus_case_findings(rows))
+        if _is_bogus_case_request(message)
+        else []
+    )
+    return ChatResponse(answer=answer, sources=sources, findings=findings)
 
 
 @app.post("/v1/chat/project", response_model=ChatResponse)
@@ -1326,4 +1400,9 @@ def chat_project(
         for row in rows
     ]
     answer = _simple_answer_from_chunks(message, rows)
-    return ChatResponse(answer=answer, sources=sources)
+    findings = (
+        _to_chat_findings(_extract_bogus_case_findings(rows))
+        if _is_bogus_case_request(message)
+        else []
+    )
+    return ChatResponse(answer=answer, sources=sources, findings=findings)
