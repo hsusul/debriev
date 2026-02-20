@@ -1,20 +1,6 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-
-from app.main import (
-    ChatResponse,
-    _extract_bogus_case_findings,
-    _is_bogus_case_request,
-    _run_bogus_extractor_self_test,
-    _simple_answer_from_chunks,
-    _to_chat_findings,
-)
+from app.main import _run_bogus_extractor_self_test
 
 
 if __name__ == "__main__":
