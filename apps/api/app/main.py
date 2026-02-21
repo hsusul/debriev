@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 import re
 from typing import Any
@@ -23,6 +24,7 @@ except (
         raise ModuleNotFoundError("sqlmodel is required for database-backed API routes")
 
 
+from app.courtlistener import CourtListenerClient, CourtListenerError
 from app.db import Citation, Document, Project, Report, get_session, init_db
 from app.retrieval.service import (
     index_document_from_db,
@@ -151,6 +153,24 @@ class ProjectChatRequest(BaseModel):
     k_total: int = 8
 
 
+class VerifyCitationsRequest(BaseModel):
+    text: str
+    doc_id: str | None = None
+    chunk_id: str | None = None
+    include_raw: bool = False
+
+
+class VerifiedCitation(BaseModel):
+    citation: str
+    matched: bool
+    results: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class VerifyCitationsResponse(BaseModel):
+    verified: list[VerifiedCitation]
+    raw: dict[str, Any] | None = None
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
@@ -161,6 +181,25 @@ def on_startup() -> None:
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.post("/verify/citations", response_model=VerifyCitationsResponse)
+def verify_citations(payload: VerifyCitationsRequest) -> VerifyCitationsResponse:
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    client = CourtListenerClient()
+    try:
+        raw = client.lookup_citations(text)
+    except CourtListenerError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    verified = _normalize_verified_citations(raw)
+    return VerifyCitationsResponse(
+        verified=verified,
+        raw=raw if payload.include_raw else None,
+    )
 
 
 def _document_response_from_row(row: Document) -> DocumentResponse:
@@ -1193,6 +1232,79 @@ def _to_chat_findings(findings: list[BogusCaseFinding]) -> list[ChatFinding]:
         )
         for finding in findings
     ]
+
+
+def _stable_json_key(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _as_result_item(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return {str(k): v for k, v in value.items()}
+    return {"value": value}
+
+
+def _normalize_verified_citations(raw: dict[str, Any]) -> list[VerifiedCitation]:
+    entries_obj: Any
+    if isinstance(raw.get("results"), list):
+        entries_obj = raw.get("results")
+    elif isinstance(raw.get("citations"), list):
+        entries_obj = raw.get("citations")
+    else:
+        entries_obj = []
+
+    entries = entries_obj if isinstance(entries_obj, list) else []
+    by_citation: dict[str, VerifiedCitation] = {}
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        citation = _normalize_ws(
+            str(
+                entry.get("citation")
+                or entry.get("cite")
+                or entry.get("normalized_citation")
+                or entry.get("text")
+                or ""
+            )
+        )
+        if not citation:
+            continue
+
+        results_source: Any = entry.get("results")
+        if not isinstance(results_source, list):
+            for key in ("clusters", "matches", "opinions"):
+                candidate = entry.get(key)
+                if isinstance(candidate, list):
+                    results_source = candidate
+                    break
+            else:
+                results_source = []
+
+        normalized_results = [
+            _as_result_item(result_item) for result_item in results_source
+        ]
+        normalized_results.sort(key=_stable_json_key)
+        matched = bool(entry.get("matched")) or bool(normalized_results)
+        citation_key = citation.lower()
+
+        existing = by_citation.get(citation_key)
+        if existing is None:
+            by_citation[citation_key] = VerifiedCitation(
+                citation=citation,
+                matched=matched,
+                results=normalized_results,
+            )
+            continue
+
+        merged = {_stable_json_key(item): item for item in existing.results}
+        for item in normalized_results:
+            merged[_stable_json_key(item)] = item
+        existing.results = sorted(merged.values(), key=_stable_json_key)
+        existing.matched = existing.matched or matched
+
+    return sorted(by_citation.values(), key=lambda item: item.citation.lower())
 
 
 def _summary_from_chunks(chunks: list[dict[str, object]]) -> str:

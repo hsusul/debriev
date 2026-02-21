@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import json
+import os
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+class CourtListenerError(RuntimeError):
+    """Raised for CourtListener client errors."""
+
+
+class CourtListenerClient:
+    def __init__(
+        self,
+        base_url: str = "https://www.courtlistener.com",
+        token_env: str = "COURTLISTENER_TOKEN",
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.token_env = token_env
+        self.timeout_seconds = timeout_seconds
+
+    def _get_token(self) -> str:
+        token = os.getenv(self.token_env, "").strip()
+        if not token:
+            raise CourtListenerError(
+                f"Missing CourtListener token in environment variable: {self.token_env}"
+            )
+        return token
+
+    def lookup_citations(self, text: str) -> dict:
+        cleaned = text.strip()
+        if not cleaned:
+            raise CourtListenerError("Citation lookup text must be non-empty")
+
+        token = self._get_token()
+        url = f"{self.base_url}/api/rest/v4/citation-lookup/"
+        payload = json.dumps({"text": cleaned}).encode("utf-8")
+        request = Request(url=url, data=payload, method="POST")
+        request.add_header("Authorization", f"Token {token}")
+        request.add_header("Content-Type", "application/json")
+        request.add_header("Accept", "application/json")
+
+        try:
+            with urlopen(request, timeout=self.timeout_seconds) as response:
+                body = response.read().decode("utf-8")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise CourtListenerError(
+                f"CourtListener request failed with status {exc.code}: {detail[:300]}"
+            ) from exc
+        except URLError as exc:
+            raise CourtListenerError(
+                f"CourtListener request failed: {exc.reason}"
+            ) from exc
+
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise CourtListenerError(
+                "CourtListener response was not valid JSON"
+            ) from exc
+
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, list):
+            return {"results": parsed}
+        return {"results": [parsed]}
