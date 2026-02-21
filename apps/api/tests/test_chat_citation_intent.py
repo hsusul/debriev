@@ -1,0 +1,149 @@
+from __future__ import annotations
+
+from hashlib import sha256
+import json
+from uuid import uuid4
+
+from sqlmodel import SQLModel, Session, create_engine
+from unittest.mock import Mock, patch
+
+from app.db import CitationVerification, Document
+from app.main import (
+    ChatRequest,
+    VerifyCitationsResponse,
+    VerifiedCitation,
+    _build_verification_text_from_chunks,
+    _normalize_ws,
+    chat,
+)
+
+
+def _make_session(tmp_path):
+    db_path = tmp_path / "chat-intent-test.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+    )
+    SQLModel.metadata.create_all(engine)
+    return Session(engine)
+
+
+def _insert_document(session: Session) -> str:
+    doc_id = uuid4()
+    session.add(
+        Document(
+            doc_id=doc_id,
+            filename="test.pdf",
+            file_path="/tmp/test.pdf",
+            stub_text="sample",
+        )
+    )
+    session.commit()
+    return str(doc_id)
+
+
+def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = _insert_document(session)
+        rows = [
+            {
+                "chunk_id": "chunk-a",
+                "text": "Roe v. Wade, 410 U.S. 113.",
+                "page": 1,
+                "score": 0.9,
+            }
+        ]
+        verification = VerifyCitationsResponse(
+            verified=[
+                VerifiedCitation(
+                    citation="410 U.S. 113", matched=True, results=[{"id": 1}]
+                )
+            ]
+        )
+        mock_verify = Mock(return_value=verification)
+
+        with patch("app.main.query_document_chunks", return_value=rows):
+            with patch("app.main._run_citation_verification", mock_verify):
+                response = chat(
+                    ChatRequest(doc_id=doc_id, message="Please verify citations"),
+                    session=session,
+                )
+
+        assert mock_verify.call_count == 1
+        assert response.tool_result is not None
+        assert response.tool_result.type == "citation_verification"
+        assert response.tool_result.results.verified[0].citation == "410 U.S. 113"
+
+
+def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = _insert_document(session)
+        rows = [
+            {
+                "chunk_id": "chunk-cache",
+                "doc_id": doc_id,
+                "text": "Brown v. Board of Education, 347 U.S. 483.",
+                "page": 2,
+                "score": 0.8,
+            }
+        ]
+        verification_text = _build_verification_text_from_chunks(rows)
+        input_hash = sha256(
+            _normalize_ws(verification_text).encode("utf-8")
+        ).hexdigest()
+        raw_payload = {
+            "results": [{"citation": "347 U.S. 483", "results": [{"id": 2}]}]
+        }
+        session.add(
+            CitationVerification(
+                input_hash=input_hash,
+                doc_id=doc_id,
+                chunk_id="chunk-cache",
+                raw_json=json.dumps(raw_payload, sort_keys=True),
+                summary_status="verified",
+            )
+        )
+        session.commit()
+
+        with patch("app.main.query_document_chunks", return_value=rows):
+            with patch(
+                "app.main.CourtListenerClient.lookup_citations",
+                side_effect=AssertionError("lookup should not be called on cache hit"),
+            ):
+                response = chat(
+                    ChatRequest(doc_id=doc_id, message="check citations"),
+                    session=session,
+                )
+
+        assert response.tool_result is not None
+        assert response.tool_result.results.verified[0].citation == "347 U.S. 483"
+
+
+def test_chat_non_trigger_behavior_unchanged(tmp_path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = _insert_document(session)
+        rows = [
+            {
+                "chunk_id": "chunk-summary",
+                "text": "This is an ordinary summary chunk without citation verification intent.",
+                "page": 1,
+                "score": 0.5,
+            }
+        ]
+
+        with patch("app.main.query_document_chunks", return_value=rows):
+            with patch(
+                "app.main._run_citation_verification",
+                side_effect=AssertionError(
+                    "verification helper should not run for non-trigger message"
+                ),
+            ):
+                response = chat(
+                    ChatRequest(doc_id=doc_id, message="Summarize this document"),
+                    session=session,
+                )
+
+        assert response.tool_result is None
+        assert response.findings == []
+        assert len(response.sources) == 1
+        assert isinstance(response.answer, str)
+        assert response.answer

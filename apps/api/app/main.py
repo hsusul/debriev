@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from hashlib import sha256
 import json
 from pathlib import Path
 import re
@@ -25,7 +27,15 @@ except (
 
 
 from app.courtlistener import CourtListenerClient, CourtListenerError
-from app.db import Citation, Document, Project, Report, get_session, init_db
+from app.db import (
+    Citation,
+    CitationVerification,
+    Document,
+    Project,
+    Report,
+    get_session,
+    init_db,
+)
 from app.retrieval.service import (
     index_document_from_db,
     query_document_chunks,
@@ -35,7 +45,15 @@ from app.retrieval.store import init_retrieval_db
 from app.settings import settings
 
 
-app = FastAPI(title="Debriev API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
+    init_db()
+    init_retrieval_db(settings.retrieval_db_path)
+    yield
+
+
+app = FastAPI(title="Debriev API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -48,7 +66,7 @@ app.add_middleware(
 )
 
 try:  # pragma: no cover - optional dependency for file uploads
-    import multipart  # type: ignore # noqa: F401
+    import python_multipart  # type: ignore # noqa: F401
 
     _HAS_MULTIPART = True
 except Exception:
@@ -143,6 +161,7 @@ class ChatResponse(BaseModel):
     answer: str
     sources: list[ChatSource]
     findings: list[ChatFinding] = Field(default_factory=list)
+    tool_result: CitationVerificationToolResult | None = None
 
 
 class ProjectChatRequest(BaseModel):
@@ -171,11 +190,9 @@ class VerifyCitationsResponse(BaseModel):
     raw: dict[str, Any] | None = None
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
-    init_db()
-    init_retrieval_db(settings.retrieval_db_path)
+class CitationVerificationToolResult(BaseModel):
+    type: str = "citation_verification"
+    results: VerifyCitationsResponse
 
 
 @app.get("/health")
@@ -183,23 +200,73 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/verify/citations", response_model=VerifyCitationsResponse)
-def verify_citations(payload: VerifyCitationsRequest) -> VerifyCitationsResponse:
-    text = payload.text.strip()
-    if not text:
+def _run_citation_verification(
+    payload: VerifyCitationsRequest,
+    session: Session,
+) -> VerifyCitationsResponse:
+    normalized_text = _normalize_ws(payload.text)
+    if not normalized_text:
         raise HTTPException(status_code=400, detail="text is required")
+
+    input_hash = sha256(normalized_text.encode("utf-8")).hexdigest()
+    cached = session.exec(
+        select(CitationVerification).where(
+            CitationVerification.input_hash == input_hash
+        )
+    ).first()
+    if cached is not None:
+        try:
+            cached_raw = json.loads(cached.raw_json)
+        except json.JSONDecodeError:
+            cached_raw = {"results": []}
+        verified = _normalize_verified_citations(
+            cached_raw if isinstance(cached_raw, dict) else {"results": []}
+        )
+        return VerifyCitationsResponse(
+            verified=verified,
+            raw=cached_raw
+            if payload.include_raw and isinstance(cached_raw, dict)
+            else None,
+        )
 
     client = CourtListenerClient()
     try:
-        raw = client.lookup_citations(text)
+        raw = client.lookup_citations(normalized_text)
     except CourtListenerError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     verified = _normalize_verified_citations(raw)
+    if not verified:
+        summary_status = "not_found"
+    elif all(item.matched for item in verified):
+        summary_status = "verified"
+    elif any(item.matched for item in verified):
+        summary_status = "ambiguous"
+    else:
+        summary_status = "not_found"
+
+    record = CitationVerification(
+        input_hash=input_hash,
+        doc_id=payload.doc_id,
+        chunk_id=payload.chunk_id,
+        raw_json=json.dumps(raw, sort_keys=True),
+        summary_status=summary_status,
+    )
+    session.add(record)
+    session.commit()
+
     return VerifyCitationsResponse(
         verified=verified,
         raw=raw if payload.include_raw else None,
     )
+
+
+@app.post("/verify/citations", response_model=VerifyCitationsResponse)
+def verify_citations(
+    payload: VerifyCitationsRequest,
+    session: Session = Depends(get_session),
+) -> VerifyCitationsResponse:
+    return _run_citation_verification(payload=payload, session=session)
 
 
 def _document_response_from_row(row: Document) -> DocumentResponse:
@@ -1213,11 +1280,29 @@ def _extract_bogus_case_findings(
 
 
 _BOGUS_LIST_KEYWORDS = ("bogus", "non-existent", "nonexistent", "fake")
+_CITATION_VERIFICATION_TRIGGERS = (
+    "verify citations",
+    "check citations",
+    "are these citations real",
+    "validate citations",
+    "courtlistener",
+    "citation lookup",
+)
+_CHAT_VERIFICATION_CODE_BLOCK_PATTERN = re.compile(
+    r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL
+)
 
 
 def _is_bogus_case_request(message: str) -> bool:
     lowered = message.lower()
     return any(keyword in lowered for keyword in _BOGUS_LIST_KEYWORDS)
+
+
+def _is_citation_verification_request(text: str) -> bool:
+    lowered = _normalize_ws(text).lower()
+    if "citation" not in lowered and "courtlistener" not in lowered:
+        return False
+    return any(trigger in lowered for trigger in _CITATION_VERIFICATION_TRIGGERS)
 
 
 def _to_chat_findings(findings: list[BogusCaseFinding]) -> list[ChatFinding]:
@@ -1232,6 +1317,98 @@ def _to_chat_findings(findings: list[BogusCaseFinding]) -> list[ChatFinding]:
         )
         for finding in findings
     ]
+
+
+def _extract_message_verification_text(message: str) -> str | None:
+    cleaned = message.strip()
+    if not cleaned:
+        return None
+
+    code_match = _CHAT_VERIFICATION_CODE_BLOCK_PATTERN.search(cleaned)
+    if code_match:
+        snippet = code_match.group(1).strip()
+        return snippet if snippet else None
+
+    if "\n" in cleaned:
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        if len(lines) >= 2:
+            first = lines[0].lower()
+            candidate_lines = (
+                lines[1:]
+                if any(trigger in first for trigger in _CITATION_VERIFICATION_TRIGGERS)
+                else lines
+            )
+            candidate = "\n".join(candidate_lines).strip()
+            if len(candidate) >= 60:
+                return candidate
+
+    if ":" in cleaned:
+        head, tail = cleaned.split(":", 1)
+        if _is_citation_verification_request(head) and len(tail.strip()) >= 60:
+            return tail.strip()
+
+    return None
+
+
+def _build_verification_text_from_chunks(
+    chunks: list[dict[str, object]], max_chars: int = 8000
+) -> str:
+    def _order_key(chunk: dict[str, object]) -> tuple[float, str, str, int]:
+        raw_score = chunk.get("score")
+        try:
+            score = float(raw_score) if raw_score is not None else 0.0
+        except (TypeError, ValueError):
+            score = 0.0
+
+        raw_page = chunk.get("page")
+        try:
+            page = int(raw_page) if raw_page is not None else -1
+        except (TypeError, ValueError):
+            page = -1
+
+        return (
+            -score,
+            str(chunk.get("doc_id") or ""),
+            str(chunk.get("chunk_id") or ""),
+            page,
+        )
+
+    ordered = sorted(chunks, key=_order_key)
+    parts: list[str] = []
+    total = 0
+    for chunk in ordered:
+        text = _normalize_ws(str(chunk.get("text", "") or ""))
+        if not text:
+            continue
+        if total >= max_chars:
+            break
+
+        remaining = max_chars - total
+        piece = text[:remaining].rstrip()
+        if not piece:
+            continue
+        parts.append(piece)
+        total += len(piece)
+        if len(piece) < len(text):
+            break
+        total += 2
+
+    return "\n\n".join(parts).strip()
+
+
+def _citation_verification_answer(result: VerifyCitationsResponse) -> str:
+    if not result.verified:
+        return "Citation verification completed. No citations were recognized."
+
+    lines = [
+        (
+            f"- {item.citation}: "
+            f"{'matched' if item.matched else 'not matched'} "
+            f"({len(item.results)} result(s))"
+        )
+        for item in result.verified
+    ]
+    return "Citation verification results:\n" + "\n".join(lines)
 
 
 def _stable_json_key(value: Any) -> str:
@@ -1532,13 +1709,41 @@ def chat(
         )
         for row in rows
     ]
-    answer = _simple_answer_from_chunks(message, rows)
-    findings = (
-        _to_chat_findings(_extract_bogus_case_findings(rows))
-        if _is_bogus_case_request(message)
-        else []
+    tool_result: CitationVerificationToolResult | None = None
+    if _is_citation_verification_request(message):
+        verification_text = _extract_message_verification_text(message)
+        if verification_text is None:
+            verification_text = _build_verification_text_from_chunks(rows)
+
+        if verification_text:
+            verification_response = _run_citation_verification(
+                payload=VerifyCitationsRequest(
+                    text=verification_text,
+                    doc_id=str(payload.doc_id),
+                ),
+                session=session,
+            )
+            answer = _citation_verification_answer(verification_response)
+            tool_result = CitationVerificationToolResult(results=verification_response)
+        else:
+            answer = (
+                "Citation verification requested, but no citation text was available."
+            )
+        findings: list[ChatFinding] = []
+    else:
+        answer = _simple_answer_from_chunks(message, rows)
+        findings = (
+            _to_chat_findings(_extract_bogus_case_findings(rows))
+            if _is_bogus_case_request(message)
+            else []
+        )
+
+    return ChatResponse(
+        answer=answer,
+        sources=sources,
+        findings=findings,
+        tool_result=tool_result,
     )
-    return ChatResponse(answer=answer, sources=sources, findings=findings)
 
 
 @app.post("/v1/chat/project", response_model=ChatResponse)
@@ -1591,10 +1796,35 @@ def chat_project(
         )
         for row in rows
     ]
-    answer = _simple_answer_from_chunks(message, rows)
-    findings = (
-        _to_chat_findings(_extract_bogus_case_findings(rows))
-        if _is_bogus_case_request(message)
-        else []
+    tool_result: CitationVerificationToolResult | None = None
+    if _is_citation_verification_request(message):
+        verification_text = _extract_message_verification_text(message)
+        if verification_text is None:
+            verification_text = _build_verification_text_from_chunks(rows)
+
+        if verification_text:
+            verification_response = _run_citation_verification(
+                payload=VerifyCitationsRequest(text=verification_text),
+                session=session,
+            )
+            answer = _citation_verification_answer(verification_response)
+            tool_result = CitationVerificationToolResult(results=verification_response)
+        else:
+            answer = (
+                "Citation verification requested, but no citation text was available."
+            )
+        findings: list[ChatFinding] = []
+    else:
+        answer = _simple_answer_from_chunks(message, rows)
+        findings = (
+            _to_chat_findings(_extract_bogus_case_findings(rows))
+            if _is_bogus_case_request(message)
+            else []
+        )
+
+    return ChatResponse(
+        answer=answer,
+        sources=sources,
+        findings=findings,
+        tool_result=tool_result,
     )
-    return ChatResponse(answer=answer, sources=sources, findings=findings)
