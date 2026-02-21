@@ -8,3 +8,11 @@ node_modules/
 .DS_Store
 CODEX.md
 data/
+
+# local artifacts
+apps/api/data/
+*.db
+
+# local data
+apps/api/data/
+*.db
