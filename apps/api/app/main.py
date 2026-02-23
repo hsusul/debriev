@@ -5,24 +5,36 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 import json
+import os
 from pathlib import Path
 import re
 from typing import Any
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 try:
-    from sqlmodel import Session, select
+    from sqlmodel import Session, create_engine, select
 except (
     ModuleNotFoundError
 ):  # pragma: no cover - allows extractor self-tests without db deps
     Session = Any  # type: ignore[assignment]
 
     def select(*args: Any, **kwargs: Any) -> Any:
+        raise ModuleNotFoundError("sqlmodel is required for database-backed API routes")
+
+    def create_engine(*args: Any, **kwargs: Any) -> Any:
         raise ModuleNotFoundError("sqlmodel is required for database-backed API routes")
 
 
@@ -33,8 +45,13 @@ from app.db import (
     Document,
     Project,
     Report,
+    VerificationJob,
+    VerificationResult,
+    get_latest_verification_result,
     get_session,
     init_db,
+    list_verification_results,
+    store_verification_result,
 )
 from app.retrieval.service import (
     index_document_from_db,
@@ -42,6 +59,7 @@ from app.retrieval.service import (
     query_project_chunks,
 )
 from app.retrieval.store import init_retrieval_db
+from app.db.session import engine
 from app.settings import settings
 
 
@@ -50,6 +68,11 @@ async def lifespan(app: FastAPI):
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
     init_db()
     init_retrieval_db(settings.retrieval_db_path)
+    token_present = bool(
+        (settings.courtlistener_token or "").strip()
+        or os.getenv("COURTLISTENER_TOKEN", "").strip()
+    )
+    print(f"CourtListener token present: {token_present}")
     yield
 
 
@@ -194,6 +217,7 @@ class CitationVerificationFinding(BaseModel):
     best_match: BestMatch | None = None
     explanation: str
     evidence: str = ""
+    probable_case_name: str | None = None
 
 
 class CitationVerificationSummary(BaseModel):
@@ -219,6 +243,7 @@ class CitationVerificationToolResult(BaseModel):
         default_factory=CitationVerificationSummary
     )
     citations: list[str] = Field(default_factory=list)
+    report: str | None = None
 
 
 class VerifyExtractedCitationsRequest(BaseModel):
@@ -226,6 +251,31 @@ class VerifyExtractedCitationsRequest(BaseModel):
     doc_id: str | None = None
     chunk_id: str | None = None
     include_raw: bool = False
+
+
+class VerificationHistoryItem(BaseModel):
+    id: int
+    created_at: datetime
+    summary: CitationVerificationSummary
+    citations_count: int
+
+
+class VerificationJobCreateRequest(BaseModel):
+    text: str | None = None
+
+
+class VerificationJobCreateResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class VerificationJobStatusResponse(BaseModel):
+    job_id: str
+    doc_id: str
+    status: str
+    summary: CitationVerificationSummary | None = None
+    error_text: str | None = None
+    result_id: int | None = None
 
 
 @app.get("/health")
@@ -316,6 +366,48 @@ def _normalize_extracted_citation(value: str) -> str:
     return _normalize_ws(value).strip(" ,;:.")
 
 
+_CITATION_REPORTER_WHITELIST = {
+    "U.S.",
+    "F.",
+    "F.2d",
+    "F.3d",
+    "F. Supp.",
+    "F. Supp. 2d",
+    "F. Supp. 3d",
+    "S. Ct.",
+}
+_CITATION_HIGH_CONFIDENCE_REPORTERS = {"U.S.", "F.3d", "F.2d"}
+_CITATION_YEAR_PATTERN = re.compile(r"\b(?:17|18|19|20)\d{2}\b")
+
+
+def _parse_reporter(citation: str) -> str | None:
+    normalized = _normalize_ws(citation)
+    if re.match(r"^\d{1,4}\s+U\.S\.\s+\d{1,4}$", normalized):
+        return "U.S."
+    series_match = re.match(r"^\d{1,4}\s+F\.(2|3)d\s+\d{1,4}$", normalized)
+    if series_match:
+        return f"F.{series_match.group(1)}d"
+    supp_series_match = re.match(
+        r"^\d{1,4}\s+F\.\s+Supp\.\s+([23])d\s+\d{1,4}$",
+        normalized,
+    )
+    if supp_series_match:
+        return f"F. Supp. {supp_series_match.group(1)}d"
+    if re.match(r"^\d{1,4}\s+F\.\s+Supp\.\s+\d{1,4}$", normalized):
+        return "F. Supp."
+    if re.match(r"^\d{1,4}\s+F\.\s+\d{1,4}$", normalized):
+        return "F."
+    if re.match(r"^\d{1,4}\s+S\.\s+Ct\.\s+\d{1,4}$", normalized):
+        return "S. Ct."
+    return None
+
+
+def _has_year_near(text: str, match_span: tuple[int, int], window: int = 80) -> bool:
+    start = max(0, match_span[0] - max(0, window))
+    end = min(len(text), match_span[1] + max(0, window))
+    return _CITATION_YEAR_PATTERN.search(text[start:end]) is not None
+
+
 def _extract_citations(text: str) -> list[str]:
     prepared = _normalize_ws(text)
     if not prepared:
@@ -379,6 +471,16 @@ def _extract_citations(text: str) -> list[str]:
                 citation = f"{vol} F. {page}"
             else:
                 citation = f"{vol} S. Ct. {page}"
+
+            reporter = _parse_reporter(citation)
+            if reporter is None or reporter not in _CITATION_REPORTER_WHITELIST:
+                continue
+            if (
+                reporter not in _CITATION_HIGH_CONFIDENCE_REPORTERS
+                and not _has_year_near(prepared, match.span())
+            ):
+                continue
+
             citation_key = _normalize_citation_string(citation)
             if citation_key and citation_key not in found:
                 found[citation_key] = citation
@@ -438,6 +540,116 @@ def _normalize_citation_list(citations: list[str]) -> list[str]:
         if key and key not in deduped:
             deduped[key] = normalized
     return [deduped[key] for key in sorted(deduped)]
+
+
+_CASE_NAME_CONNECTOR_WORDS = (
+    "of",
+    "the",
+    "for",
+    "in",
+    "on",
+    "at",
+    "to",
+    "de",
+    "la",
+    "del",
+    "da",
+    "van",
+    "von",
+)
+_CASE_NAME_TOKEN_PATTERN = (
+    r"(?:[A-Z][A-Za-z0-9&.'-]*|" + "|".join(_CASE_NAME_CONNECTOR_WORDS) + r"|et\.?)"
+)
+_CASE_NAME_SIDE_PATTERN = (
+    r"[A-Z][A-Za-z0-9&.'-]*(?:\s+" + _CASE_NAME_TOKEN_PATTERN + r"){0,8}"
+)
+_CASE_NAME_NEAR_PATTERN = re.compile(
+    r"\b(" + _CASE_NAME_SIDE_PATTERN + r"\s+v\.?\s+" + _CASE_NAME_SIDE_PATTERN + r")\b"
+)
+
+
+def _find_first_citation_match_span(text: str, citation: str) -> tuple[int, int] | None:
+    pattern = _citation_pattern_for_evidence(citation)
+    match = pattern.search(text)
+    if match is None:
+        return None
+    return match.start(), match.end()
+
+
+def _extract_case_name_near(
+    text: str, match_span: tuple[int, int], window: int = 140
+) -> str | None:
+    if not text:
+        return None
+
+    start = max(0, match_span[0] - max(0, window))
+    end = min(len(text), match_span[1] + max(0, window))
+    neighborhood = text[start:end]
+    if not neighborhood:
+        return None
+
+    candidates: list[tuple[int, str]] = []
+    for case_match in _CASE_NAME_NEAR_PATTERN.finditer(neighborhood):
+        candidate = _normalize_ws(case_match.group(1)).strip(" ,;:.()[]{}")
+        candidate = re.sub(
+            r"^(?:See(?:\s+also)?|Cf\.?|But\s+see|Compare|In)\s+",
+            "",
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not candidate:
+            continue
+        letters_only = re.sub(r"[^A-Za-z]", "", candidate)
+        if letters_only and letters_only.isupper():
+            continue
+
+        absolute_start = start + case_match.start()
+        distance = match_span[0] - absolute_start
+        if distance < 0:
+            continue
+        candidates.append((distance, candidate))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: (item[0], item[1].lower(), item[1]))
+    return candidates[0][1]
+
+
+def _extract_case_name_by_citation(
+    text: str,
+    citations: list[str],
+) -> dict[str, str | None]:
+    names_by_citation: dict[str, str | None] = {}
+    for citation in citations:
+        span = _find_first_citation_match_span(text, citation)
+        if span is None:
+            names_by_citation[citation] = None
+            continue
+        names_by_citation[citation] = _extract_case_name_near(text, span)
+    return names_by_citation
+
+
+def _extract_case_name_by_citation_from_chunks(
+    chunks: list[dict[str, object]],
+    citations: list[str],
+) -> dict[str, str | None]:
+    indexed_chunks = list(enumerate(chunks))
+    if all(str(chunk.get("chunk_id") or "").strip() for _, chunk in indexed_chunks):
+        indexed_chunks.sort(key=lambda item: str(item[1].get("chunk_id") or ""))
+
+    names_by_citation: dict[str, str | None] = {
+        citation: None for citation in citations
+    }
+    for citation in citations:
+        for _, chunk in indexed_chunks:
+            chunk_text = str(chunk.get("text", "") or "")
+            span = _find_first_citation_match_span(chunk_text, citation)
+            if span is None:
+                continue
+            names_by_citation[citation] = _extract_case_name_near(chunk_text, span)
+            break
+    return names_by_citation
 
 
 def _citation_pattern_for_evidence(citation: str) -> re.Pattern[str]:
@@ -626,6 +838,7 @@ def _run_citation_verification_for_citations(
     chunk_id: str | None = None,
     batch_size: int = 25,
     evidence_by_citation: dict[str, str] | None = None,
+    probable_case_name_by_citation: dict[str, str | None] | None = None,
 ) -> VerifyCitationsResponse:
     normalized_citations = _normalize_citation_list(citations)
     if not normalized_citations:
@@ -643,6 +856,18 @@ def _run_citation_verification_for_citations(
         if key not in normalized_evidence:
             normalized_evidence[key] = ""
 
+    normalized_case_names: dict[str, str | None] = {}
+    if probable_case_name_by_citation is not None:
+        for raw_citation, case_name in probable_case_name_by_citation.items():
+            key = _normalize_citation_string(raw_citation)
+            if not key:
+                continue
+            normalized_case_names[key] = _normalize_ws(case_name) if case_name else None
+    for citation in normalized_citations:
+        key = _normalize_citation_string(citation)
+        if key not in normalized_case_names:
+            normalized_case_names[key] = None
+
     input_hash = _citation_list_hash(normalized_citations)
     cached = session.exec(
         select(CitationVerification).where(
@@ -658,6 +883,7 @@ def _run_citation_verification_for_citations(
             cached_raw if isinstance(cached_raw, dict) else {"results": []},
             requested_citations=normalized_citations,
             evidence_by_citation=normalized_evidence,
+            probable_case_name_by_citation=normalized_case_names,
         )
         return VerifyCitationsResponse(
             findings=findings,
@@ -683,6 +909,7 @@ def _run_citation_verification_for_citations(
         merged_raw,
         requested_citations=normalized_citations,
         evidence_by_citation=normalized_evidence,
+        probable_case_name_by_citation=normalized_case_names,
     )
     summary = _summarize_citation_findings(findings)
     if summary.total == 0 or summary.not_found == summary.total:
@@ -710,20 +937,294 @@ def _run_citation_verification_for_citations(
     )
 
 
+def _persist_verification_response(
+    *,
+    session: Session,
+    doc_id: str,
+    source_text: str,
+    response: VerifyCitationsResponse,
+) -> None:
+    normalized_text = _normalize_ws(source_text)
+    store_verification_result(
+        session,
+        doc_id=doc_id.strip(),
+        input_hash=sha256(normalized_text.encode("utf-8")).hexdigest(),
+        citations_hash=_citation_list_hash(response.citations),
+        citations=response.citations,
+        findings=[finding.model_dump() for finding in response.findings],
+        summary=response.summary.model_dump(),
+    )
+
+
+def _run_extracted_verification(
+    *,
+    session: Session,
+    text: str,
+    doc_id: str | None,
+    chunk_id: str | None,
+    include_raw: bool,
+) -> VerifyCitationsResponse:
+    citations = _extract_citations(text)
+    evidence_by_citation = _extract_citation_evidence(text, citations)
+    probable_case_name_by_citation = _extract_case_name_by_citation(text, citations)
+    response = _run_citation_verification_for_citations(
+        citations=citations,
+        session=session,
+        include_raw=include_raw,
+        doc_id=doc_id,
+        chunk_id=chunk_id,
+        evidence_by_citation=evidence_by_citation,
+        probable_case_name_by_citation=probable_case_name_by_citation,
+    )
+    if doc_id and doc_id.strip():
+        _persist_verification_response(
+            session=session,
+            doc_id=doc_id,
+            source_text=text,
+            response=response,
+        )
+    return response
+
+
+def _build_doc_verification_text(*, session: Session, doc_id: UUID) -> str:
+    report = session.exec(select(Report).where(Report.doc_id == doc_id)).first()
+    if report is not None:
+        report_json = report.report_json if isinstance(report.report_json, dict) else {}
+        citations_raw = report_json.get("citations")
+        if isinstance(citations_raw, list):
+            pieces: list[str] = []
+            for entry in citations_raw:
+                if not isinstance(entry, dict):
+                    continue
+                raw = _normalize_ws(str(entry.get("raw", "") or ""))
+                context = _normalize_ws(str(entry.get("context_text", "") or ""))
+                part = "\n".join([item for item in (raw, context) if item])
+                if part:
+                    pieces.append(part)
+            joined = "\n\n".join(pieces).strip()
+            if joined:
+                return joined
+
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is not None and _normalize_ws(document.stub_text):
+        return document.stub_text
+
+    raise HTTPException(
+        status_code=400, detail="No extracted text available for verification"
+    )
+
+
+def _execute_verification_job(job_id: str, text: str | None, session: Session) -> None:
+    job = session.exec(
+        select(VerificationJob).where(VerificationJob.id == job_id)
+    ).first()
+    if job is None:
+        return
+
+    job.status = "running"
+    job.error_text = None
+    job.updated_at = datetime.now(UTC)
+    session.add(job)
+    session.commit()
+
+    try:
+        doc_uuid = UUID(job.doc_id)
+        verification_text = (
+            _normalize_ws(text or "")
+            if text is not None and _normalize_ws(text)
+            else _build_doc_verification_text(session=session, doc_id=doc_uuid)
+        )
+        _run_extracted_verification(
+            session=session,
+            text=verification_text,
+            doc_id=job.doc_id,
+            chunk_id=None,
+            include_raw=False,
+        )
+        latest_result = get_latest_verification_result(session, doc_id=job.doc_id)
+        job.status = "done"
+        job.result_id = latest_result.id if latest_result is not None else None
+        job.error_text = None
+    except Exception as exc:
+        job.status = "failed"
+        job.result_id = None
+        job.error_text = _normalize_ws(str(exc))[:500]
+
+    job.updated_at = datetime.now(UTC)
+    session.add(job)
+    session.commit()
+
+
+def _run_verification_job_background(
+    job_id: str,
+    text: str | None,
+    database_url: str | None = None,
+) -> None:
+    if database_url:
+        connect_args = (
+            {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+        )
+        background_engine = create_engine(
+            database_url, connect_args=connect_args, echo=False
+        )
+    else:
+        background_engine = engine
+
+    with Session(background_engine) as background_session:
+        _execute_verification_job(job_id=job_id, text=text, session=background_session)
+
+
 @app.post("/verify/citations/extracted", response_model=VerifyCitationsResponse)
 def verify_citations_extracted(
     payload: VerifyExtractedCitationsRequest,
     session: Session = Depends(get_session),
 ) -> VerifyCitationsResponse:
-    citations = _extract_citations(payload.text)
-    evidence_by_citation = _extract_citation_evidence(payload.text, citations)
-    return _run_citation_verification_for_citations(
-        citations=citations,
+    return _run_extracted_verification(
         session=session,
-        include_raw=payload.include_raw,
+        text=payload.text,
         doc_id=payload.doc_id,
         chunk_id=payload.chunk_id,
-        evidence_by_citation=evidence_by_citation,
+        include_raw=payload.include_raw,
+    )
+
+
+@app.get("/reports/{doc_id}/verification", response_model=VerifyCitationsResponse)
+def get_report_verification(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> VerifyCitationsResponse:
+    stored = get_latest_verification_result(session, doc_id=str(doc_id))
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Verification result not found")
+
+    try:
+        citations_raw = json.loads(stored.citations_json)
+        findings_raw = json.loads(stored.findings_json)
+        summary_raw = json.loads(stored.summary_json)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500, detail="Stored verification result is invalid JSON"
+        ) from exc
+
+    citations = (
+        [str(item) for item in citations_raw] if isinstance(citations_raw, list) else []
+    )
+
+    findings: list[CitationVerificationFinding] = []
+    if isinstance(findings_raw, list):
+        for item in findings_raw:
+            if isinstance(item, dict):
+                findings.append(CitationVerificationFinding.model_validate(item))
+
+    findings.sort(key=lambda item: _normalize_citation_string(item.citation))
+    summary = CitationVerificationSummary.model_validate(
+        summary_raw if isinstance(summary_raw, dict) else {}
+    )
+    return VerifyCitationsResponse(
+        findings=findings,
+        summary=summary,
+        citations=citations,
+        raw=None,
+    )
+
+
+@app.get(
+    "/reports/{doc_id}/verification/history",
+    response_model=list[VerificationHistoryItem],
+)
+def get_report_verification_history(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> list[VerificationHistoryItem]:
+    rows = list_verification_results(session, doc_id=str(doc_id))
+    history: list[VerificationHistoryItem] = []
+    for row in rows:
+        try:
+            citations_raw = json.loads(row.citations_json)
+            summary_raw = json.loads(row.summary_json)
+        except json.JSONDecodeError:
+            citations_raw = []
+            summary_raw = {}
+        citations_count = len(citations_raw) if isinstance(citations_raw, list) else 0
+        history.append(
+            VerificationHistoryItem(
+                id=int(row.id or 0),
+                created_at=row.created_at,
+                summary=CitationVerificationSummary.model_validate(
+                    summary_raw if isinstance(summary_raw, dict) else {}
+                ),
+                citations_count=citations_count,
+            )
+        )
+    history.sort(key=lambda item: (item.created_at, item.id), reverse=True)
+    return history
+
+
+@app.post(
+    "/reports/{doc_id}/verification/jobs",
+    response_model=VerificationJobCreateResponse,
+)
+def create_verification_job(
+    doc_id: UUID,
+    payload: VerificationJobCreateRequest,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+) -> VerificationJobCreateResponse:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    job = VerificationJob(doc_id=str(doc_id), status="queued")
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+
+    text_payload = (
+        payload.text.strip() if payload.text and payload.text.strip() else None
+    )
+    bind = session.get_bind()
+    database_url = str(bind.url) if bind is not None else None
+    background_tasks.add_task(
+        _run_verification_job_background, job.id, text_payload, database_url
+    )
+
+    return VerificationJobCreateResponse(job_id=job.id, status=job.status)
+
+
+@app.get(
+    "/reports/{doc_id}/verification/jobs/{job_id}",
+    response_model=VerificationJobStatusResponse,
+)
+def get_verification_job_status(
+    doc_id: UUID,
+    job_id: str,
+    session: Session = Depends(get_session),
+) -> VerificationJobStatusResponse:
+    job = session.exec(
+        select(VerificationJob).where(VerificationJob.id == job_id)
+    ).first()
+    if job is None or job.doc_id != str(doc_id):
+        raise HTTPException(status_code=404, detail="Verification job not found")
+
+    summary: CitationVerificationSummary | None = None
+    if job.status == "done" and job.result_id is not None:
+        stored = session.exec(
+            select(VerificationResult).where(VerificationResult.id == job.result_id)
+        ).first()
+        if stored is not None:
+            try:
+                summary_raw = json.loads(stored.summary_json)
+            except json.JSONDecodeError:
+                summary_raw = {}
+            summary = CitationVerificationSummary.model_validate(
+                summary_raw if isinstance(summary_raw, dict) else {}
+            )
+
+    return VerificationJobStatusResponse(
+        job_id=job.id,
+        doc_id=job.doc_id,
+        status=job.status,
+        summary=summary,
+        error_text=job.error_text,
+        result_id=job.result_id,
     )
 
 
@@ -1046,6 +1547,24 @@ def get_report(doc_id: UUID, session: Session = Depends(get_session)) -> dict[st
         raise HTTPException(status_code=404, detail="Report not found")
 
     return DebrievReport.model_validate(report.report_json).model_dump()
+
+
+@app.get("/reports/{doc_id}/bogus", response_model=list[ChatFinding])
+def get_report_bogus(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> list[ChatFinding]:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    source_text = document.stub_text or ""
+    if not _normalize_ws(source_text):
+        return []
+
+    findings = _extract_bogus_case_findings(
+        [{"doc_id": str(doc_id), "chunk_id": f"{doc_id}:stub", "text": source_text}]
+    )
+    return _to_chat_findings(findings)
 
 
 _CASE_WORD = r"[A-Z](?:[A-Za-z0-9&'-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9&'-]+)*\.?"
@@ -1873,6 +2392,90 @@ def _citation_verification_answer(result: VerifyCitationsResponse) -> str:
     return header + "\n" + "\n".join(lines)
 
 
+def _truncate_report_snippet(text: str, max_len: int = 160) -> str:
+    cleaned = _normalize_ws(text)
+    if len(cleaned) <= max_len:
+        return cleaned
+    return f"{cleaned[: max_len - 1].rstrip()}…"
+
+
+def _format_citation_verification_report(
+    tool_result: CitationVerificationToolResult,
+    limit: int = 8,
+) -> str:
+    summary = tool_result.summary
+    lines = [
+        "Citation Verification Report",
+        f"Total citations found: {summary.total}",
+        (
+            f"Verified: {summary.verified} | "
+            f"Not found: {summary.not_found} | "
+            f"Ambiguous: {summary.ambiguous}"
+        ),
+    ]
+
+    not_found = sorted(
+        [item for item in tool_result.findings if item.status == "not_found"],
+        key=lambda item: _normalize_citation_string(item.citation),
+    )
+    ambiguous = sorted(
+        [item for item in tool_result.findings if item.status == "ambiguous"],
+        key=lambda item: _normalize_citation_string(item.citation),
+    )
+
+    if not_found:
+        lines.append(f"Top Not Found (max {min(limit, len(not_found))}):")
+        for item in not_found[:limit]:
+            snippet = _truncate_report_snippet(item.evidence)
+            line = f"- {item.citation}"
+            if snippet:
+                line += f" — {snippet}"
+            lines.append(line)
+    else:
+        lines.append("Top Not Found: none")
+
+    if ambiguous:
+        lines.append(f"Top Ambiguous (max {min(limit, len(ambiguous))}):")
+        for item in ambiguous[:limit]:
+            line = f"- {item.citation}"
+            if item.best_match is not None:
+                best_parts: list[str] = []
+                if item.best_match.case_name:
+                    best_parts.append(item.best_match.case_name)
+                if item.best_match.year is not None:
+                    best_parts.append(str(item.best_match.year))
+                if item.best_match.court:
+                    best_parts.append(item.best_match.court)
+                if item.best_match.matched_citation:
+                    best_parts.append(item.best_match.matched_citation)
+                if best_parts:
+                    line += f" (best match: {', '.join(best_parts)})"
+            snippet = _truncate_report_snippet(item.evidence)
+            if snippet:
+                line += f" — {snippet}"
+            lines.append(line)
+    else:
+        lines.append("Top Ambiguous: none")
+
+    return "\n".join(lines)
+
+
+def _build_citation_tool_result(
+    verification_response: VerifyCitationsResponse,
+) -> CitationVerificationToolResult:
+    base = CitationVerificationToolResult(
+        findings=verification_response.findings,
+        summary=verification_response.summary,
+        citations=verification_response.citations,
+    )
+    return CitationVerificationToolResult(
+        findings=base.findings,
+        summary=base.summary,
+        citations=base.citations,
+        report=_format_citation_verification_report(base),
+    )
+
+
 def _stable_json_key(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -1918,6 +2521,23 @@ def _optional_year(data: dict[str, Any], keys: tuple[str, ...]) -> int | None:
     return None
 
 
+def _normalize_courtlistener_url(url: str | None) -> str | None:
+    if url is None:
+        return None
+    cleaned = _normalize_ws(url)
+    if not cleaned:
+        return None
+    if cleaned.startswith(("http://", "https://")):
+        return cleaned
+    if cleaned.startswith("//"):
+        return f"https:{cleaned}"
+    if cleaned.startswith("/"):
+        return f"https://www.courtlistener.com{cleaned}"
+    if cleaned.startswith("www.courtlistener.com"):
+        return f"https://{cleaned}"
+    return cleaned
+
+
 def _to_best_match(
     candidate: dict[str, Any], fallback_citation: str | None
 ) -> BestMatch | None:
@@ -1944,6 +2564,7 @@ def _to_best_match(
             "cluster_url",
         ),
     )
+    url = _normalize_courtlistener_url(url)
     matched_citation = _optional_text(
         candidate,
         ("citation", "cite", "normalized_citation", "matched_citation"),
@@ -1991,6 +2612,7 @@ def _courtlistener_raw_to_findings(
     raw: dict[str, Any],
     requested_citations: list[str] | None = None,
     evidence_by_citation: dict[str, str] | None = None,
+    probable_case_name_by_citation: dict[str, str | None] | None = None,
 ) -> list[CitationVerificationFinding]:
     by_citation: dict[str, dict[str, Any]] = {}
     if requested_citations:
@@ -2080,6 +2702,11 @@ def _courtlistener_raw_to_findings(
                     evidence_by_citation.get(citation_key, "")
                     if evidence_by_citation is not None
                     else ""
+                ),
+                probable_case_name=(
+                    probable_case_name_by_citation.get(citation_key)
+                    if probable_case_name_by_citation is not None
+                    else None
                 ),
             )
         )
@@ -2318,9 +2945,15 @@ def chat(
         if message_text is not None:
             citations = _extract_citations(message_text)
             evidence_by_citation = _extract_citation_evidence(message_text, citations)
+            probable_case_name_by_citation = _extract_case_name_by_citation(
+                message_text, citations
+            )
         else:
             citations = _extract_citations_from_chunks(rows)
             evidence_by_citation = _extract_citation_evidence_from_chunks(
+                rows, citations
+            )
+            probable_case_name_by_citation = _extract_case_name_by_citation_from_chunks(
                 rows, citations
             )
         if citations:
@@ -2329,21 +2962,14 @@ def chat(
                 session=session,
                 doc_id=str(payload.doc_id),
                 evidence_by_citation=evidence_by_citation,
+                probable_case_name_by_citation=probable_case_name_by_citation,
             )
             answer = _citation_verification_answer(verification_response)
-            tool_result = CitationVerificationToolResult(
-                findings=verification_response.findings,
-                summary=verification_response.summary,
-                citations=verification_response.citations,
-            )
+            tool_result = _build_citation_tool_result(verification_response)
         else:
             verification_response = VerifyCitationsResponse()
             answer = "Citation verification requested, but no citations were detected."
-            tool_result = CitationVerificationToolResult(
-                findings=verification_response.findings,
-                summary=verification_response.summary,
-                citations=verification_response.citations,
-            )
+            tool_result = _build_citation_tool_result(verification_response)
         findings: list[ChatFinding] = []
     else:
         answer = _simple_answer_from_chunks(message, rows)
@@ -2417,9 +3043,15 @@ def chat_project(
         if message_text is not None:
             citations = _extract_citations(message_text)
             evidence_by_citation = _extract_citation_evidence(message_text, citations)
+            probable_case_name_by_citation = _extract_case_name_by_citation(
+                message_text, citations
+            )
         else:
             citations = _extract_citations_from_chunks(rows)
             evidence_by_citation = _extract_citation_evidence_from_chunks(
+                rows, citations
+            )
+            probable_case_name_by_citation = _extract_case_name_by_citation_from_chunks(
                 rows, citations
             )
         if citations:
@@ -2427,21 +3059,14 @@ def chat_project(
                 citations=citations,
                 session=session,
                 evidence_by_citation=evidence_by_citation,
+                probable_case_name_by_citation=probable_case_name_by_citation,
             )
             answer = _citation_verification_answer(verification_response)
-            tool_result = CitationVerificationToolResult(
-                findings=verification_response.findings,
-                summary=verification_response.summary,
-                citations=verification_response.citations,
-            )
+            tool_result = _build_citation_tool_result(verification_response)
         else:
             verification_response = VerifyCitationsResponse()
             answer = "Citation verification requested, but no citations were detected."
-            tool_result = CitationVerificationToolResult(
-                findings=verification_response.findings,
-                summary=verification_response.summary,
-                citations=verification_response.citations,
-            )
+            tool_result = _build_citation_tool_result(verification_response)
         findings: list[ChatFinding] = []
     else:
         answer = _simple_answer_from_chunks(message, rows)

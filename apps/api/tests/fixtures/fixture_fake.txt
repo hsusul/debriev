@@ -1,0 +1,2 @@
+The filing includes a malformed cite, Foo v. Bar, 999 F.99 999 (2099), that should not match.
+It also references Foo v. Bar, 999 F.3d 999 (2099), plus Roe v. Wade, 410 U.S. 113 (1973).

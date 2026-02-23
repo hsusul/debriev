@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 
 import VerifyButton from "./VerifyButton";
@@ -26,6 +26,47 @@ type ReportPayload = {
   summary: string;
   citations: ReportCitation[];
   created_at?: string | null;
+};
+
+type BestMatch = {
+  case_name: string | null;
+  court: string | null;
+  year: number | null;
+  url: string | null;
+  matched_citation: string | null;
+};
+
+type CitationVerificationFinding = {
+  citation: string;
+  status: "verified" | "not_found" | "ambiguous";
+  confidence: number;
+  best_match: BestMatch | null;
+  explanation: string;
+  evidence: string;
+  probable_case_name: string | null;
+};
+
+type CitationVerificationSummary = {
+  total: number;
+  verified: number;
+  not_found: number;
+  ambiguous: number;
+};
+
+type VerifyCitationsResponse = {
+  findings: CitationVerificationFinding[];
+  summary: CitationVerificationSummary;
+  citations: string[];
+  raw?: Record<string, unknown> | null;
+};
+
+type BogusFinding = {
+  case_name: string;
+  reason_label: string;
+  reason_phrase: string;
+  evidence: string;
+  doc_id?: string | null;
+  chunk_id?: string | null;
 };
 
 const PUBLIC_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
@@ -77,6 +118,230 @@ function buildCounts(citations: ReportCitation[]) {
   }
 
   return { verified, notFound, errors, unverified };
+}
+
+async function verifyExtractedCitations(payload: {
+  text: string;
+  doc_id?: string;
+}): Promise<VerifyCitationsResponse> {
+  const response = await fetch(`${PUBLIC_API_BASE}/verify/citations/extracted`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let detail = raw.trim();
+    try {
+      const parsed = JSON.parse(raw) as { detail?: string };
+      if (parsed.detail) {
+        detail = parsed.detail;
+      }
+    } catch {
+      // Keep response text if body is not JSON.
+    }
+    const suffix = detail ? ` - ${detail}` : "";
+    throw new Error(`${response.status} ${response.statusText || "Verification failed"}${suffix}`);
+  }
+
+  return (await response.json()) as VerifyCitationsResponse;
+}
+
+async function fetchStoredVerification(docId: string): Promise<VerifyCitationsResponse | null> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/verification`, {
+    method: "GET"
+  });
+
+  if (response.status === 404) {
+    return null;
+  }
+
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let detail = raw.trim();
+    try {
+      const parsed = JSON.parse(raw) as { detail?: string };
+      if (parsed.detail) {
+        detail = parsed.detail;
+      }
+    } catch {
+      // Keep response text if body is not JSON.
+    }
+    const suffix = detail ? ` - ${detail}` : "";
+    throw new Error(`${response.status} ${response.statusText || "Failed to load verification"}${suffix}`);
+  }
+
+  return (await response.json()) as VerifyCitationsResponse;
+}
+
+async function fetchBogusFindings(docId: string): Promise<BogusFinding[]> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/bogus`, {
+    method: "GET"
+  });
+
+  if (response.status === 404) {
+    return [];
+  }
+
+  if (!response.ok) {
+    const raw = await response.text().catch(() => "");
+    let detail = raw.trim();
+    try {
+      const parsed = JSON.parse(raw) as { detail?: string };
+      if (parsed.detail) {
+        detail = parsed.detail;
+      }
+    } catch {
+      // Keep response text if body is not JSON.
+    }
+    const suffix = detail ? ` - ${detail}` : "";
+    throw new Error(`${response.status} ${response.statusText || "Failed to load bogus findings"}${suffix}`);
+  }
+
+  return (await response.json()) as BogusFinding[];
+}
+
+function normalizeCitationKey(value: string | null | undefined): string {
+  return normalizeWhitespace(value || "").replace(/[^\w\s.]/g, "");
+}
+
+function findMatchingFinding(
+  citation: ReportCitation,
+  findings: CitationVerificationFinding[],
+): CitationVerificationFinding | null {
+  const rawKey = normalizeCitationKey(citation.raw);
+  const contextKey = normalizeCitationKey(citation.context_text || "");
+
+  for (const finding of findings) {
+    const citationKey = normalizeCitationKey(finding.citation);
+    if (!citationKey) {
+      continue;
+    }
+    if (rawKey === citationKey || rawKey.includes(citationKey) || contextKey.includes(citationKey)) {
+      return finding;
+    }
+  }
+
+  for (const finding of findings) {
+    const probable = normalizeCitationKey(finding.probable_case_name);
+    if (probable && probable === rawKey) {
+      return finding;
+    }
+  }
+
+  return null;
+}
+
+function truncateSnippet(value: string, maxLength = 160): string {
+  const cleaned = value.replace(/\s+/g, " ").trim();
+  if (cleaned.length <= maxLength) {
+    return cleaned;
+  }
+  return `${cleaned.slice(0, maxLength - 1).trimEnd()}…`;
+}
+
+function formatVerificationReport(result: VerifyCitationsResponse): string {
+  const lines = [
+    "Citation Verification Report",
+    `Total citations found: ${result.summary.total}`,
+    `Verified: ${result.summary.verified} | Not found: ${result.summary.not_found} | Ambiguous: ${result.summary.ambiguous}`
+  ];
+
+  const notFound = result.findings
+    .filter((finding) => finding.status === "not_found")
+    .sort((a, b) => normalizeCitationKey(a.citation).localeCompare(normalizeCitationKey(b.citation)));
+  const ambiguous = result.findings
+    .filter((finding) => finding.status === "ambiguous")
+    .sort((a, b) => normalizeCitationKey(a.citation).localeCompare(normalizeCitationKey(b.citation)));
+
+  if (notFound.length > 0) {
+    lines.push(`Top Not Found (max ${Math.min(8, notFound.length)}):`);
+    for (const finding of notFound.slice(0, 8)) {
+      const snippet = truncateSnippet(finding.evidence);
+      lines.push(snippet ? `- ${finding.citation} — ${snippet}` : `- ${finding.citation}`);
+    }
+  } else {
+    lines.push("Top Not Found: none");
+  }
+
+  if (ambiguous.length > 0) {
+    lines.push(`Top Ambiguous (max ${Math.min(8, ambiguous.length)}):`);
+    for (const finding of ambiguous.slice(0, 8)) {
+      const matchBits = [
+        finding.best_match?.case_name || "",
+        finding.best_match?.year ? String(finding.best_match.year) : "",
+        finding.best_match?.court || ""
+      ].filter(Boolean);
+      const matchInfo = matchBits.length > 0 ? ` (best match: ${matchBits.join(", ")})` : "";
+      const snippet = truncateSnippet(finding.evidence);
+      lines.push(`${`- ${finding.citation}${matchInfo}`}${snippet ? ` — ${snippet}` : ""}`);
+    }
+  } else {
+    lines.push("Top Ambiguous: none");
+  }
+
+  return lines.join("\n");
+}
+
+function formatVerificationMarkdown(result: VerifyCitationsResponse): string {
+  const notFound = result.findings
+    .filter((finding) => finding.status === "not_found")
+    .sort((a, b) => normalizeCitationKey(a.citation).localeCompare(normalizeCitationKey(b.citation)));
+  const ambiguous = result.findings
+    .filter((finding) => finding.status === "ambiguous")
+    .sort((a, b) => normalizeCitationKey(a.citation).localeCompare(normalizeCitationKey(b.citation)));
+
+  const lines: string[] = [
+    "# Citation Verification Report",
+    "",
+    `- Total citations found: ${result.summary.total}`,
+    `- Verified: ${result.summary.verified}`,
+    `- Not found: ${result.summary.not_found}`,
+    `- Ambiguous: ${result.summary.ambiguous}`,
+    ""
+  ];
+
+  lines.push("## Top Not Found");
+  if (notFound.length === 0) {
+    lines.push("- none");
+  } else {
+    for (const finding of notFound.slice(0, 8)) {
+      const snippet = truncateSnippet(finding.evidence);
+      lines.push(snippet ? `- ${finding.citation} — ${snippet}` : `- ${finding.citation}`);
+    }
+  }
+  lines.push("");
+
+  lines.push("## Top Ambiguous");
+  if (ambiguous.length === 0) {
+    lines.push("- none");
+  } else {
+    for (const finding of ambiguous.slice(0, 8)) {
+      const bestParts = [
+        finding.best_match?.case_name || "",
+        finding.best_match?.year ? String(finding.best_match.year) : "",
+        finding.best_match?.court || ""
+      ].filter(Boolean);
+      const bestText = bestParts.length > 0 ? ` (best match: ${bestParts.join(", ")})` : "";
+      const snippet = truncateSnippet(finding.evidence);
+      lines.push(`${`- ${finding.citation}${bestText}`}${snippet ? ` — ${snippet}` : ""}`);
+    }
+  }
+
+  return lines.join("\n");
+}
+
+function downloadTextFile(filename: string, content: string, mimeType: string): void {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 function highlightText(text: string, allTerms: string[], selectedRaw: string | null): string {
@@ -134,11 +399,104 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const [selectedPage, setSelectedPage] = useState<number | null>(null);
   const [pdfError, setPdfError] = useState("");
   const [jumpMessage, setJumpMessage] = useState("");
+  const [verification, setVerification] = useState<VerifyCitationsResponse | null>(null);
+  const [verificationBannerError, setVerificationBannerError] = useState("");
+  const [bogusFindings, setBogusFindings] = useState<BogusFinding[]>([]);
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
-  const counts = useMemo(() => buildCounts(report.citations), [report.citations]);
-  const highlightTerms = useMemo(() => report.citations.map((citation) => citation.raw), [report.citations]);
+  const citationRows = useMemo(
+    () =>
+      report.citations.map((citation, idx) => {
+        const finding = verification ? findMatchingFinding(citation, verification.findings) : null;
+        return { citation, idx, finding };
+      }),
+    [report.citations, verification],
+  );
+  const counts = useMemo(() => {
+    if (!verification) {
+      return buildCounts(report.citations);
+    }
+    return {
+      verified: verification.summary.verified,
+      notFound: verification.summary.not_found,
+      errors: 0,
+      unverified: Math.max(report.citations.length - verification.summary.total, 0),
+    };
+  }, [report.citations, verification]);
+  const overallScore = useMemo(() => {
+    if (!verification) {
+      return report.overall_score;
+    }
+    const total = Math.max(verification.summary.total, 1);
+    return Math.round((100 * verification.summary.verified) / total);
+  }, [report.overall_score, verification]);
+  const verificationReport = useMemo(() => (verification ? formatVerificationReport(verification) : null), [verification]);
+  const selectedFinding = useMemo(() => {
+    if (selectedCitationIndex === null) {
+      return null;
+    }
+    return citationRows.find((row) => row.idx === selectedCitationIndex)?.finding || null;
+  }, [citationRows, selectedCitationIndex]);
+  const highlightTerms = useMemo(() => {
+    const terms = report.citations.map((citation) => citation.raw);
+    if (verification) {
+      terms.push(...verification.citations);
+    }
+    return terms;
+  }, [report.citations, verification]);
+  const verificationText = useMemo(() => {
+    const pieces = report.citations
+      .map((citation) => [citation.raw, citation.context_text || ""].filter(Boolean).join("\n"))
+      .filter((piece) => piece.trim().length > 0);
+    return pieces.join("\n\n");
+  }, [report.citations]);
   const pdfUrl = `${PUBLIC_API_BASE}/v1/documents/${docId}/pdf`;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadStoredVerification = async () => {
+      try {
+        const stored = await fetchStoredVerification(docId);
+        if (!cancelled && stored) {
+          setVerification(stored);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : "Failed to load verification";
+          setVerificationBannerError(message);
+        }
+      }
+    };
+
+    void loadStoredVerification();
+    return () => {
+      cancelled = true;
+    };
+  }, [docId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadBogus = async () => {
+      try {
+        const findings = await fetchBogusFindings(docId);
+        if (!cancelled) {
+          setBogusFindings(findings);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : "Failed to load bogus findings";
+          setVerificationBannerError(message);
+        }
+      }
+    };
+
+    void loadBogus();
+    return () => {
+      cancelled = true;
+    };
+  }, [docId]);
 
   const onDocumentLoadSuccess = async (pdf: any) => {
     setNumPages(pdf.numPages);
@@ -188,10 +546,89 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     setJumpMessage("");
   };
 
+  const onVerify = async () => {
+    setVerificationBannerError("");
+
+    if (!verificationText.trim()) {
+      throw new Error("No extracted citation text available to verify.");
+    }
+
+    try {
+      const response = await verifyExtractedCitations({
+        text: verificationText,
+        doc_id: docId
+      });
+      setVerification(response);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Verification request failed";
+      setVerificationBannerError(message);
+      throw err;
+    }
+  };
+
+  const selectBogusFinding = (finding: BogusFinding) => {
+    setSelectedCitationRaw(finding.case_name);
+    const findingKey = normalizeCitationKey(finding.case_name);
+    const row = citationRows.find(({ citation }) => {
+      const raw = normalizeCitationKey(citation.raw);
+      const context = normalizeCitationKey(citation.context_text || "");
+      return (
+        raw.includes(findingKey) ||
+        findingKey.includes(raw) ||
+        context.includes(findingKey)
+      );
+    });
+
+    if (row) {
+      jumpToCitation(row.citation, row.idx);
+      return;
+    }
+    setJumpMessage("Related citation row not found for bogus finding.");
+  };
+
   return (
     <section className="space-y-4">
       <div className="rounded-2xl border border-slate-700/70 bg-slate-900/70 p-4">
-        <VerifyButton docId={docId} />
+        <div className="mb-3 flex flex-wrap items-center gap-2">
+          <VerifyButton onVerify={onVerify} label="Verify" />
+          <button
+            type="button"
+            onClick={() =>
+              verification
+                ? downloadTextFile(
+                  `verification-${docId}.json`,
+                  `${JSON.stringify(verification, null, 2)}\n`,
+                  "application/json",
+                )
+                : null
+            }
+            disabled={!verification}
+            className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Export JSON
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              verification
+                ? downloadTextFile(
+                  `verification-${docId}.md`,
+                  `${formatVerificationMarkdown(verification)}\n`,
+                  "text/markdown",
+                )
+                : null
+            }
+            disabled={!verification}
+            className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Export Markdown
+          </button>
+        </div>
+        {verificationBannerError ? (
+          <p className="mb-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
+            {verificationBannerError}
+          </p>
+        ) : null}
         <div className="grid gap-3 text-sm text-slate-200 md:grid-cols-3">
           <p className="rounded-lg border border-slate-700 bg-slate-800/70 p-3">
             <strong className="block text-xs uppercase tracking-wide text-slate-400">Summary</strong>
@@ -199,7 +636,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
           </p>
           <p className="rounded-lg border border-slate-700 bg-slate-800/70 p-3">
             <strong className="block text-xs uppercase tracking-wide text-slate-400">Overall Score</strong>
-            <span className="mt-1 block text-lg font-semibold text-blue-200">{report.overall_score}</span>
+            <span className="mt-1 block text-lg font-semibold text-blue-200">{overallScore}</span>
           </p>
           <p className="rounded-lg border border-slate-700 bg-slate-800/70 p-3">
             <strong className="block text-xs uppercase tracking-wide text-slate-400">Counts</strong>
@@ -280,12 +717,29 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                 </tr>
               </thead>
               <tbody>
-                {report.citations.map((citation, idx) => (
+                {citationRows.map(({ citation, idx, finding }) => {
+                  const status = finding?.status || citation.verification_status || "unverified";
+                  const link = finding?.best_match?.url || citation.verification_details?.courtlistener_url || null;
+                  const relatedBogus = bogusFindings.some((item) => {
+                    const findingKey = normalizeCitationKey(item.case_name);
+                    const raw = normalizeCitationKey(citation.raw);
+                    const context = normalizeCitationKey(citation.context_text || "");
+                    return (
+                      raw.includes(findingKey) ||
+                      findingKey.includes(raw) ||
+                      context.includes(findingKey)
+                    );
+                  });
+                  return (
                   <tr
                     key={`${citation.raw}-${citation.start ?? "na"}-${idx}`}
                     onClick={() => jumpToCitation(citation, idx)}
                     className={`cursor-pointer transition ${
-                      selectedCitationIndex === idx ? "bg-blue-500/10" : "hover:bg-slate-800/70"
+                      selectedCitationIndex === idx
+                        ? "bg-blue-500/10"
+                        : relatedBogus
+                          ? "bg-amber-500/5 hover:bg-amber-500/10"
+                          : "hover:bg-slate-800/70"
                     }`}
                   >
                     <td className="border-b border-slate-800 px-2 py-2 align-top">{citation.raw}</td>
@@ -293,11 +747,11 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                       {truncateContext(citation.context_text) || "-"}
                     </td>
                     <td className="border-b border-slate-800 px-2 py-2 align-top">
-                      <span className={statusPill(citation.verification_status)}>{citation.verification_status || "unverified"}</span>
+                      <span className={statusPill(status)}>{status}</span>
                     </td>
                     <td className="border-b border-slate-800 px-2 py-2 align-top">
-                      {citation.verification_details?.courtlistener_url ? (
-                        <a href={citation.verification_details.courtlistener_url} target="_blank" rel="noopener" className="text-blue-300 hover:text-blue-200">
+                      {link ? (
+                        <a href={link} target="_blank" rel="noopener" className="text-blue-300 hover:text-blue-200">
                           Open
                         </a>
                       ) : (
@@ -305,12 +759,79 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                       )}
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           )}
+
+          {selectedCitationIndex !== null ? (
+            <div className="mt-3 rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-xs text-slate-300">
+              <p className="font-semibold uppercase tracking-wide text-slate-400">Citation Details</p>
+              <div className="mt-2 space-y-2">
+                <p>
+                  <span className="text-slate-400">Probable case name:</span>{" "}
+                  <span className="text-slate-100">{selectedFinding?.probable_case_name || "-"}</span>
+                </p>
+                <p>
+                  <span className="text-slate-400">Evidence:</span>{" "}
+                  <span className="text-slate-100">{selectedFinding?.evidence || "-"}</span>
+                </p>
+                <p>
+                  <span className="text-slate-400">Confidence:</span>{" "}
+                  <span className="text-slate-100">
+                    {typeof selectedFinding?.confidence === "number" ? selectedFinding.confidence.toFixed(2) : "-"}
+                  </span>
+                </p>
+                <p>
+                  <span className="text-slate-400">Best match:</span>{" "}
+                  <span className="text-slate-100">
+                    {selectedFinding?.best_match?.case_name || "-"}
+                    {selectedFinding?.best_match?.court ? ` (${selectedFinding.best_match.court})` : ""}
+                    {selectedFinding?.best_match?.year ? ` ${selectedFinding.best_match.year}` : ""}
+                  </span>
+                </p>
+              </div>
+            </div>
+          ) : null}
         </aside>
       </div>
+
+      {verificationReport ? (
+        <details open className="rounded-2xl border border-slate-700/70 bg-slate-900/60 p-4 text-sm text-slate-200">
+          <summary className="cursor-pointer font-medium text-slate-100">Verification Report</summary>
+          <pre className="mt-3 overflow-auto rounded-lg border border-slate-700 bg-slate-950/70 p-3 text-xs text-slate-300">
+            {verificationReport}
+          </pre>
+        </details>
+      ) : null}
+
+      <section className="rounded-2xl border border-slate-700/70 bg-slate-900/60 p-4 text-sm text-slate-200">
+        <h3 className="text-sm font-semibold text-slate-100">
+          Bogus citations ({bogusFindings.length})
+        </h3>
+        {bogusFindings.length === 0 ? (
+          <p className="mt-2 text-xs text-slate-400">No bogus citation findings.</p>
+        ) : (
+          <ul className="mt-3 space-y-2">
+            {bogusFindings.map((finding, idx) => (
+              <li key={`${finding.case_name}-${idx}`}>
+                <button
+                  type="button"
+                  onClick={() => selectBogusFinding(finding)}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2 text-left hover:bg-slate-700/70"
+                >
+                  <p className="text-sm font-medium text-slate-100">{finding.case_name}</p>
+                  <p className="text-xs text-slate-400">
+                    {finding.reason_label} ({finding.reason_phrase})
+                  </p>
+                  <p className="mt-1 text-xs text-slate-300">{finding.evidence || "-"}</p>
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <details className="rounded-2xl border border-slate-700/70 bg-slate-900/60 p-4 text-sm text-slate-200">
         <summary className="cursor-pointer font-medium text-slate-100">View raw JSON</summary>

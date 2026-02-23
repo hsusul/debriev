@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -16,13 +17,24 @@ class CourtListenerClient:
         base_url: str = "https://www.courtlistener.com",
         token_env: str = "COURTLISTENER_TOKEN",
         timeout_seconds: float = 10.0,
+        max_retries: int = 3,
+        backoff_seconds: float = 0.2,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token_env = token_env
         self.timeout_seconds = timeout_seconds
+        self.max_retries = max(0, max_retries)
+        self.backoff_seconds = max(0.0, backoff_seconds)
 
     def _get_token(self) -> str:
         token = os.getenv(self.token_env, "").strip()
+        if not token:
+            try:
+                from app.settings import settings
+
+                token = (settings.courtlistener_token or "").strip()
+            except Exception:
+                token = ""
         if not token:
             raise CourtListenerError(
                 f"Missing CourtListener token in environment variable: {self.token_env}"
@@ -42,18 +54,25 @@ class CourtListenerClient:
         request.add_header("Content-Type", "application/json")
         request.add_header("Accept", "application/json")
 
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                body = response.read().decode("utf-8")
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise CourtListenerError(
-                f"CourtListener request failed with status {exc.code}: {detail[:300]}"
-            ) from exc
-        except URLError as exc:
-            raise CourtListenerError(
-                f"CourtListener request failed: {exc.reason}"
-            ) from exc
+        body = ""
+        for attempt in range(self.max_retries + 1):
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    body = response.read().decode("utf-8")
+                break
+            except HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                retryable = exc.code == 429 or 500 <= exc.code <= 599
+                if retryable and attempt < self.max_retries:
+                    time.sleep(self.backoff_seconds * (2**attempt))
+                    continue
+                raise CourtListenerError(
+                    f"CourtListener request failed with status {exc.code}: {detail[:300]}"
+                ) from exc
+            except URLError as exc:
+                raise CourtListenerError(
+                    f"CourtListener request failed: {exc.reason}"
+                ) from exc
 
         try:
             parsed = json.loads(body)

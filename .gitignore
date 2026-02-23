@@ -9,10 +9,15 @@ node_modules/
 CODEX.md
 data/
 
-# local artifacts
-apps/api/data/
+# local db files
 *.db
+apps/api/*.db
+apps/api/data/
 
 # local data
 apps/api/data/
 *.db
+
+# secrets
+.env
+apps/api/.env

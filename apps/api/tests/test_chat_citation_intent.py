@@ -55,15 +55,16 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
             findings=[
                 CitationVerificationFinding(
                     citation="410 U.S. 113",
-                    status="verified",
-                    confidence=1.0,
+                    status="not_found",
+                    confidence=0.0,
                     best_match=None,
-                    explanation="One CourtListener match was returned with an exact citation match.",
+                    explanation="No CourtListener matches were returned for this citation.",
                     evidence="Roe v. Wade, 410 U.S. 113.",
+                    probable_case_name="Roe v. Wade",
                 )
             ],
             summary=CitationVerificationSummary(
-                total=1, verified=1, not_found=0, ambiguous=0
+                total=1, verified=0, not_found=1, ambiguous=0
             ),
             citations=["410 U.S. 113"],
         )
@@ -84,8 +85,12 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
         assert response.tool_result.type == "citation_verification"
         assert response.tool_result.findings[0].citation == "410 U.S. 113"
         assert response.tool_result.findings[0].evidence == "Roe v. Wade, 410 U.S. 113."
+        assert response.tool_result.findings[0].probable_case_name == "Roe v. Wade"
         assert response.tool_result.summary.total == 1
         assert response.tool_result.citations == ["410 U.S. 113"]
+        assert response.tool_result.report is not None
+        assert "Citation Verification Report" in response.tool_result.report
+        assert "410 U.S. 113" in response.tool_result.report
 
 
 def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
@@ -124,12 +129,23 @@ def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
                     ChatRequest(doc_id=doc_id, message="check citations"),
                     session=session,
                 )
+                response_2 = chat(
+                    ChatRequest(doc_id=doc_id, message="check citations"),
+                    session=session,
+                )
 
         assert response.tool_result is not None
         assert response.tool_result.findings[0].citation == "347 U.S. 483"
         assert "347 U.S. 483" in response.tool_result.findings[0].evidence
+        assert (
+            response.tool_result.findings[0].probable_case_name
+            == "Brown v. Board of Education"
+        )
         assert response.tool_result.summary.verified == 1
         assert response.tool_result.citations == ["347 U.S. 483"]
+        assert response.tool_result.report is not None
+        assert "Top Not Found" in response.tool_result.report
+        assert response.tool_result.report == response_2.tool_result.report
 
 
 def test_chat_citation_intent_no_citations_detected(tmp_path) -> None:
