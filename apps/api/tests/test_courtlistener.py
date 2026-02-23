@@ -16,6 +16,8 @@ from app.main import (
     VerifyCitationsRequest,
     VerifyExtractedCitationsRequest,
     _extract_citations,
+    _extract_citation_evidence,
+    _extract_citation_evidence_from_chunks,
     _extract_citations_from_chunks,
     _run_citation_verification_for_citations,
     _courtlistener_raw_to_findings,
@@ -392,3 +394,39 @@ def test_verify_citations_extracted_endpoint_returns_summary(tmp_path: Path) -> 
         "not_found": 1,
         "ambiguous": 0,
     }
+    findings_by_citation = {item["citation"]: item for item in response["findings"]}
+    assert "410 U.S. 113" in findings_by_citation["410 U.S. 113"]["evidence"]
+    assert findings_by_citation["123 F.3d 456"]["evidence"] != ""
+
+
+def test_extract_citation_evidence_adds_ellipses_deterministically() -> None:
+    text = (
+        "Start context "
+        + ("x" * 200)
+        + " includes 410 U.S. 113 in the middle "
+        + ("y" * 200)
+    )
+    evidence = _extract_citation_evidence(text, ["410 U.S. 113"], window=30)
+    snippet = evidence["410 U.S. 113"]
+    assert snippet.startswith("…")
+    assert snippet.endswith("…")
+    assert "410 U.S. 113" in snippet
+
+
+def test_extract_citation_evidence_from_chunks_uses_earliest_matching_chunk() -> None:
+    chunks = [
+        {"chunk_id": "chunk-1", "text": "No citation here."},
+        {
+            "chunk_id": "chunk-2",
+            "text": "Relevant text includes 123 F.3d 456 and more.",
+        },
+        {"chunk_id": "chunk-3", "text": "Another mention 123 F.3d 456 later."},
+    ]
+    evidence = _extract_citation_evidence_from_chunks(chunks, ["123 F.3d 456"])
+    assert evidence["123 F.3d 456"].startswith("Relevant text includes 123 F.3d 456")
+
+
+def test_extract_citation_evidence_empty_when_not_found() -> None:
+    text = "This has no reporter citation."
+    evidence = _extract_citation_evidence(text, ["410 U.S. 113"])
+    assert evidence["410 U.S. 113"] == ""

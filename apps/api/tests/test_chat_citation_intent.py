@@ -59,6 +59,7 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
                     confidence=1.0,
                     best_match=None,
                     explanation="One CourtListener match was returned with an exact citation match.",
+                    evidence="Roe v. Wade, 410 U.S. 113.",
                 )
             ],
             summary=CitationVerificationSummary(
@@ -82,6 +83,7 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
         assert response.tool_result is not None
         assert response.tool_result.type == "citation_verification"
         assert response.tool_result.findings[0].citation == "410 U.S. 113"
+        assert response.tool_result.findings[0].evidence == "Roe v. Wade, 410 U.S. 113."
         assert response.tool_result.summary.total == 1
         assert response.tool_result.citations == ["410 U.S. 113"]
 
@@ -125,6 +127,7 @@ def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
 
         assert response.tool_result is not None
         assert response.tool_result.findings[0].citation == "347 U.S. 483"
+        assert "347 U.S. 483" in response.tool_result.findings[0].evidence
         assert response.tool_result.summary.verified == 1
         assert response.tool_result.citations == ["347 U.S. 483"]
 

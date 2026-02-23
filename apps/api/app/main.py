@@ -193,6 +193,7 @@ class CitationVerificationFinding(BaseModel):
     confidence: float
     best_match: BestMatch | None = None
     explanation: str
+    evidence: str = ""
 
 
 class CitationVerificationSummary(BaseModel):
@@ -439,6 +440,114 @@ def _normalize_citation_list(citations: list[str]) -> list[str]:
     return [deduped[key] for key in sorted(deduped)]
 
 
+def _citation_pattern_for_evidence(citation: str) -> re.Pattern[str]:
+    normalized = _normalize_extracted_citation(citation)
+
+    us_match = re.match(r"^(\d{1,4})\s+U\.S\.\s+(\d{1,4})$", normalized)
+    if us_match:
+        vol, page = us_match.groups()
+        return re.compile(
+            rf"\b{vol}\s+U\.?\s*S\.?\s+{page}\b",
+            flags=re.IGNORECASE,
+        )
+
+    f_series_match = re.match(r"^(\d{1,4})\s+F\.(\d)d\s+(\d{1,4})$", normalized)
+    if f_series_match:
+        vol, series, page = f_series_match.groups()
+        return re.compile(
+            rf"\b{vol}\s+F\.?\s*{series}d\s+{page}\b",
+            flags=re.IGNORECASE,
+        )
+
+    f_supp_match = re.match(
+        r"^(\d{1,4})\s+F\.\s+Supp\.\s+(?:(\d)d\s+)?(\d{1,4})$",
+        normalized,
+    )
+    if f_supp_match:
+        vol, series, page = f_supp_match.groups()
+        if series:
+            return re.compile(
+                rf"\b{vol}\s+F\.?\s*Supp\.?\s*{series}d\s+{page}\b",
+                flags=re.IGNORECASE,
+            )
+        return re.compile(
+            rf"\b{vol}\s+F\.?\s*Supp\.?\s+{page}\b",
+            flags=re.IGNORECASE,
+        )
+
+    f_match = re.match(r"^(\d{1,4})\s+F\.\s+(\d{1,4})$", normalized)
+    if f_match:
+        vol, page = f_match.groups()
+        return re.compile(rf"\b{vol}\s+F\.?\s+{page}\b", flags=re.IGNORECASE)
+
+    sct_match = re.match(r"^(\d{1,4})\s+S\.\s+Ct\.\s+(\d{1,4})$", normalized)
+    if sct_match:
+        vol, page = sct_match.groups()
+        return re.compile(
+            rf"\b{vol}\s+S\.?\s*Ct\.?\s+{page}\b",
+            flags=re.IGNORECASE,
+        )
+
+    escaped = re.escape(normalized)
+    escaped = escaped.replace(r"\ ", r"\s+")
+    return re.compile(escaped, flags=re.IGNORECASE)
+
+
+def _extract_citation_evidence(
+    text: str,
+    citations: list[str],
+    window: int = 90,
+) -> dict[str, str]:
+    evidence_by_citation: dict[str, str] = {}
+    raw_text = text or ""
+
+    for citation in citations:
+        pattern = _citation_pattern_for_evidence(citation)
+        match = pattern.search(raw_text)
+        if match is None:
+            evidence_by_citation[citation] = ""
+            continue
+
+        start = max(0, match.start() - max(0, window))
+        end = min(len(raw_text), match.end() + max(0, window))
+        snippet = _normalize_ws(raw_text[start:end])
+        if not snippet:
+            evidence_by_citation[citation] = ""
+            continue
+
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(raw_text) else ""
+        evidence_by_citation[citation] = f"{prefix}{snippet}{suffix}"
+
+    return evidence_by_citation
+
+
+def _extract_citation_evidence_from_chunks(
+    chunks: list[dict[str, object]],
+    citations: list[str],
+    per_citation_max_snippets: int = 1,
+) -> dict[str, str]:
+    if per_citation_max_snippets <= 0:
+        return {citation: "" for citation in citations}
+
+    indexed_chunks = list(enumerate(chunks))
+    if all(str(chunk.get("chunk_id") or "").strip() for _, chunk in indexed_chunks):
+        indexed_chunks.sort(key=lambda item: str(item[1].get("chunk_id") or ""))
+
+    evidence_by_citation = {citation: "" for citation in citations}
+    for citation in citations:
+        for _, chunk in indexed_chunks:
+            chunk_text = str(chunk.get("text", "") or "")
+            snippet = _extract_citation_evidence(chunk_text, [citation]).get(
+                citation, ""
+            )
+            if snippet:
+                evidence_by_citation[citation] = snippet
+                break
+
+    return evidence_by_citation
+
+
 def _citation_list_hash(citations: list[str]) -> str:
     normalized = _normalize_citation_list(citations)
     return sha256("|".join(normalized).encode("utf-8")).hexdigest()
@@ -516,10 +625,23 @@ def _run_citation_verification_for_citations(
     doc_id: str | None = None,
     chunk_id: str | None = None,
     batch_size: int = 25,
+    evidence_by_citation: dict[str, str] | None = None,
 ) -> VerifyCitationsResponse:
     normalized_citations = _normalize_citation_list(citations)
     if not normalized_citations:
         return VerifyCitationsResponse()
+
+    normalized_evidence: dict[str, str] = {}
+    if evidence_by_citation is not None:
+        for raw_citation, snippet in evidence_by_citation.items():
+            key = _normalize_citation_string(raw_citation)
+            if not key:
+                continue
+            normalized_evidence[key] = _normalize_ws(snippet) if snippet else ""
+    for citation in normalized_citations:
+        key = _normalize_citation_string(citation)
+        if key not in normalized_evidence:
+            normalized_evidence[key] = ""
 
     input_hash = _citation_list_hash(normalized_citations)
     cached = session.exec(
@@ -535,6 +657,7 @@ def _run_citation_verification_for_citations(
         findings = _courtlistener_raw_to_findings(
             cached_raw if isinstance(cached_raw, dict) else {"results": []},
             requested_citations=normalized_citations,
+            evidence_by_citation=normalized_evidence,
         )
         return VerifyCitationsResponse(
             findings=findings,
@@ -559,6 +682,7 @@ def _run_citation_verification_for_citations(
     findings = _courtlistener_raw_to_findings(
         merged_raw,
         requested_citations=normalized_citations,
+        evidence_by_citation=normalized_evidence,
     )
     summary = _summarize_citation_findings(findings)
     if summary.total == 0 or summary.not_found == summary.total:
@@ -592,12 +716,14 @@ def verify_citations_extracted(
     session: Session = Depends(get_session),
 ) -> VerifyCitationsResponse:
     citations = _extract_citations(payload.text)
+    evidence_by_citation = _extract_citation_evidence(payload.text, citations)
     return _run_citation_verification_for_citations(
         citations=citations,
         session=session,
         include_raw=payload.include_raw,
         doc_id=payload.doc_id,
         chunk_id=payload.chunk_id,
+        evidence_by_citation=evidence_by_citation,
     )
 
 
@@ -1864,6 +1990,7 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[str, str, int, str, 
 def _courtlistener_raw_to_findings(
     raw: dict[str, Any],
     requested_citations: list[str] | None = None,
+    evidence_by_citation: dict[str, str] | None = None,
 ) -> list[CitationVerificationFinding]:
     by_citation: dict[str, dict[str, Any]] = {}
     if requested_citations:
@@ -1949,6 +2076,11 @@ def _courtlistener_raw_to_findings(
                 confidence=confidence,
                 best_match=best_match,
                 explanation=explanation,
+                evidence=(
+                    evidence_by_citation.get(citation_key, "")
+                    if evidence_by_citation is not None
+                    else ""
+                ),
             )
         )
 
@@ -2183,16 +2315,20 @@ def chat(
     tool_result: CitationVerificationToolResult | None = None
     if _is_citation_verification_request(message):
         message_text = _extract_message_verification_text(message)
-        citations = (
-            _extract_citations(message_text)
-            if message_text is not None
-            else _extract_citations_from_chunks(rows)
-        )
+        if message_text is not None:
+            citations = _extract_citations(message_text)
+            evidence_by_citation = _extract_citation_evidence(message_text, citations)
+        else:
+            citations = _extract_citations_from_chunks(rows)
+            evidence_by_citation = _extract_citation_evidence_from_chunks(
+                rows, citations
+            )
         if citations:
             verification_response = _run_citation_verification_for_citations(
                 citations=citations,
                 session=session,
                 doc_id=str(payload.doc_id),
+                evidence_by_citation=evidence_by_citation,
             )
             answer = _citation_verification_answer(verification_response)
             tool_result = CitationVerificationToolResult(
@@ -2278,15 +2414,19 @@ def chat_project(
     tool_result: CitationVerificationToolResult | None = None
     if _is_citation_verification_request(message):
         message_text = _extract_message_verification_text(message)
-        citations = (
-            _extract_citations(message_text)
-            if message_text is not None
-            else _extract_citations_from_chunks(rows)
-        )
+        if message_text is not None:
+            citations = _extract_citations(message_text)
+            evidence_by_citation = _extract_citation_evidence(message_text, citations)
+        else:
+            citations = _extract_citations_from_chunks(rows)
+            evidence_by_citation = _extract_citation_evidence_from_chunks(
+                rows, citations
+            )
         if citations:
             verification_response = _run_citation_verification_for_citations(
                 citations=citations,
                 session=session,
+                evidence_by_citation=evidence_by_citation,
             )
             answer = _citation_verification_answer(verification_response)
             tool_result = CitationVerificationToolResult(
