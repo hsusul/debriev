@@ -179,20 +179,30 @@ class VerifyCitationsRequest(BaseModel):
     include_raw: bool = False
 
 
-class VerifiedCitation(BaseModel):
+class BestMatch(BaseModel):
+    case_name: str | None = None
+    court: str | None = None
+    year: int | None = None
+    url: str | None = None
+    matched_citation: str | None = None
+
+
+class CitationVerificationFinding(BaseModel):
     citation: str
-    matched: bool
-    results: list[dict[str, Any]] = Field(default_factory=list)
+    status: str
+    confidence: float
+    best_match: BestMatch | None = None
+    explanation: str
 
 
 class VerifyCitationsResponse(BaseModel):
-    verified: list[VerifiedCitation]
+    findings: list[CitationVerificationFinding]
     raw: dict[str, Any] | None = None
 
 
 class CitationVerificationToolResult(BaseModel):
     type: str = "citation_verification"
-    results: VerifyCitationsResponse
+    findings: list[CitationVerificationFinding]
 
 
 @app.get("/health")
@@ -219,11 +229,11 @@ def _run_citation_verification(
             cached_raw = json.loads(cached.raw_json)
         except json.JSONDecodeError:
             cached_raw = {"results": []}
-        verified = _normalize_verified_citations(
+        findings = _courtlistener_raw_to_findings(
             cached_raw if isinstance(cached_raw, dict) else {"results": []}
         )
         return VerifyCitationsResponse(
-            verified=verified,
+            findings=findings,
             raw=cached_raw
             if payload.include_raw and isinstance(cached_raw, dict)
             else None,
@@ -235,12 +245,13 @@ def _run_citation_verification(
     except CourtListenerError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    verified = _normalize_verified_citations(raw)
-    if not verified:
+    findings = _courtlistener_raw_to_findings(raw)
+    statuses = {item.status for item in findings}
+    if not findings or statuses == {"not_found"}:
         summary_status = "not_found"
-    elif all(item.matched for item in verified):
+    elif statuses == {"verified"}:
         summary_status = "verified"
-    elif any(item.matched for item in verified):
+    elif "ambiguous" in statuses or "verified" in statuses:
         summary_status = "ambiguous"
     else:
         summary_status = "not_found"
@@ -256,7 +267,7 @@ def _run_citation_verification(
     session.commit()
 
     return VerifyCitationsResponse(
-        verified=verified,
+        findings=findings,
         raw=raw if payload.include_raw else None,
     )
 
@@ -1397,16 +1408,12 @@ def _build_verification_text_from_chunks(
 
 
 def _citation_verification_answer(result: VerifyCitationsResponse) -> str:
-    if not result.verified:
+    if not result.findings:
         return "Citation verification completed. No citations were recognized."
 
     lines = [
-        (
-            f"- {item.citation}: "
-            f"{'matched' if item.matched else 'not matched'} "
-            f"({len(item.results)} result(s))"
-        )
-        for item in result.verified
+        f"- {item.citation}: {item.status} (confidence {item.confidence:.2f})"
+        for item in result.findings
     ]
     return "Citation verification results:\n" + "\n".join(lines)
 
@@ -1421,7 +1428,113 @@ def _as_result_item(value: Any) -> dict[str, Any]:
     return {"value": value}
 
 
-def _normalize_verified_citations(raw: dict[str, Any]) -> list[VerifiedCitation]:
+def _normalize_citation_string(value: str) -> str:
+    lowered = _normalize_ws(value).lower()
+    lowered = re.sub(r"[^\w\s.]", "", lowered)
+    return _normalize_ws(lowered).strip(" .")
+
+
+def _optional_text(data: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str):
+            normalized = _normalize_ws(value)
+            if normalized:
+                return normalized
+        if isinstance(value, dict):
+            nested = _optional_text(value, ("name", "label", "value", "full_name"))
+            if nested:
+                return nested
+    return None
+
+
+def _optional_year(data: dict[str, Any], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, int):
+            return value
+        if isinstance(value, str):
+            match = re.search(r"\b(19|20)\d{2}\b", value)
+            if match:
+                try:
+                    return int(match.group(0))
+                except ValueError:
+                    continue
+    return None
+
+
+def _to_best_match(
+    candidate: dict[str, Any], fallback_citation: str | None
+) -> BestMatch | None:
+    case_name = _optional_text(
+        candidate,
+        (
+            "case_name",
+            "caseName",
+            "name",
+            "caption",
+            "case",
+            "case_name_full",
+        ),
+    )
+    court = _optional_text(candidate, ("court", "court_name", "courtName"))
+    year = _optional_year(candidate, ("year", "date_filed", "dateFiled", "date"))
+    url = _optional_text(
+        candidate,
+        (
+            "url",
+            "absolute_url",
+            "frontend_url",
+            "opinion_url",
+            "cluster_url",
+        ),
+    )
+    matched_citation = _optional_text(
+        candidate,
+        ("citation", "cite", "normalized_citation", "matched_citation"),
+    )
+    if matched_citation is None:
+        matched_citation = fallback_citation
+
+    if not any((case_name, court, year, url, matched_citation)):
+        return None
+
+    return BestMatch(
+        case_name=case_name,
+        court=court,
+        year=year,
+        url=url,
+        matched_citation=matched_citation,
+    )
+
+
+def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[str, str, int, str, str]:
+    case_name = _optional_text(
+        candidate,
+        ("case_name", "caseName", "name", "caption", "case", "case_name_full"),
+    )
+    court = _optional_text(candidate, ("court", "court_name", "courtName"))
+    year = _optional_year(candidate, ("year", "date_filed", "dateFiled", "date"))
+    url = _optional_text(
+        candidate,
+        ("url", "absolute_url", "frontend_url", "opinion_url", "cluster_url"),
+    )
+    citation = _optional_text(
+        candidate,
+        ("citation", "cite", "normalized_citation", "matched_citation"),
+    )
+    return (
+        _normalize_citation_string(case_name or ""),
+        _normalize_citation_string(court or ""),
+        year or 0,
+        _normalize_citation_string(url or ""),
+        _normalize_citation_string(citation or ""),
+    )
+
+
+def _courtlistener_raw_to_findings(
+    raw: dict[str, Any],
+) -> list[CitationVerificationFinding]:
     entries_obj: Any
     if isinstance(raw.get("results"), list):
         entries_obj = raw.get("results")
@@ -1431,7 +1544,7 @@ def _normalize_verified_citations(raw: dict[str, Any]) -> list[VerifiedCitation]
         entries_obj = []
 
     entries = entries_obj if isinstance(entries_obj, list) else []
-    by_citation: dict[str, VerifiedCitation] = {}
+    by_citation: dict[str, dict[str, Any]] = {}
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -1463,25 +1576,71 @@ def _normalize_verified_citations(raw: dict[str, Any]) -> list[VerifiedCitation]
             _as_result_item(result_item) for result_item in results_source
         ]
         normalized_results.sort(key=_stable_json_key)
-        matched = bool(entry.get("matched")) or bool(normalized_results)
-        citation_key = citation.lower()
+        citation_key = _normalize_citation_string(citation)
+        if not citation_key:
+            continue
 
         existing = by_citation.get(citation_key)
         if existing is None:
-            by_citation[citation_key] = VerifiedCitation(
-                citation=citation,
-                matched=matched,
-                results=normalized_results,
-            )
+            by_citation[citation_key] = {
+                "citation": citation,
+                "results": normalized_results,
+            }
             continue
 
-        merged = {_stable_json_key(item): item for item in existing.results}
+        merged = {_stable_json_key(item): item for item in existing["results"]}
         for item in normalized_results:
             merged[_stable_json_key(item)] = item
-        existing.results = sorted(merged.values(), key=_stable_json_key)
-        existing.matched = existing.matched or matched
+        existing["results"] = sorted(merged.values(), key=_stable_json_key)
 
-    return sorted(by_citation.values(), key=lambda item: item.citation.lower())
+    findings: list[CitationVerificationFinding] = []
+    for citation_key in sorted(by_citation):
+        citation = str(by_citation[citation_key]["citation"])
+        candidates = list(by_citation[citation_key]["results"])
+        candidate_count = len(candidates)
+        best_match: BestMatch | None = None
+
+        if candidate_count == 0:
+            status = "not_found"
+            confidence = 0.0
+            explanation = "No CourtListener matches were returned for this citation."
+        elif candidate_count == 1:
+            best_match = _to_best_match(candidates[0], fallback_citation=citation)
+            matched_citation = (
+                best_match.matched_citation if best_match is not None else None
+            )
+            exact_match = _normalize_citation_string(
+                matched_citation or ""
+            ) == _normalize_citation_string(citation)
+            status = "verified"
+            confidence = 1.0 if exact_match else 0.8
+            explanation = (
+                "One CourtListener match was returned with an exact citation match."
+                if exact_match
+                else "One CourtListener match was returned, but citation text differs after normalization."
+            )
+        else:
+            ordered_candidates = sorted(candidates, key=_candidate_sort_key)
+            best_match = _to_best_match(
+                ordered_candidates[0], fallback_citation=citation
+            )
+            status = "ambiguous"
+            confidence = 0.5
+            explanation = (
+                "Multiple CourtListener matches were returned for this citation."
+            )
+
+        findings.append(
+            CitationVerificationFinding(
+                citation=citation,
+                status=status,
+                confidence=confidence,
+                best_match=best_match,
+                explanation=explanation,
+            )
+        )
+
+    return sorted(findings, key=lambda item: _normalize_citation_string(item.citation))
 
 
 def _summary_from_chunks(chunks: list[dict[str, object]]) -> str:
@@ -1724,7 +1883,9 @@ def chat(
                 session=session,
             )
             answer = _citation_verification_answer(verification_response)
-            tool_result = CitationVerificationToolResult(results=verification_response)
+            tool_result = CitationVerificationToolResult(
+                findings=verification_response.findings
+            )
         else:
             answer = (
                 "Citation verification requested, but no citation text was available."
@@ -1808,7 +1969,9 @@ def chat_project(
                 session=session,
             )
             answer = _citation_verification_answer(verification_response)
-            tool_result = CitationVerificationToolResult(results=verification_response)
+            tool_result = CitationVerificationToolResult(
+                findings=verification_response.findings
+            )
         else:
             answer = (
                 "Citation verification requested, but no citation text was available."

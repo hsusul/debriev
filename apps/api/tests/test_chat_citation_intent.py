@@ -9,9 +9,9 @@ from unittest.mock import Mock, patch
 
 from app.db import CitationVerification, Document
 from app.main import (
+    CitationVerificationFinding,
     ChatRequest,
     VerifyCitationsResponse,
-    VerifiedCitation,
     _build_verification_text_from_chunks,
     _normalize_ws,
     chat,
@@ -53,9 +53,13 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
             }
         ]
         verification = VerifyCitationsResponse(
-            verified=[
-                VerifiedCitation(
-                    citation="410 U.S. 113", matched=True, results=[{"id": 1}]
+            findings=[
+                CitationVerificationFinding(
+                    citation="410 U.S. 113",
+                    status="verified",
+                    confidence=1.0,
+                    best_match=None,
+                    explanation="One CourtListener match was returned with an exact citation match.",
                 )
             ]
         )
@@ -71,7 +75,7 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
         assert mock_verify.call_count == 1
         assert response.tool_result is not None
         assert response.tool_result.type == "citation_verification"
-        assert response.tool_result.results.verified[0].citation == "410 U.S. 113"
+        assert response.tool_result.findings[0].citation == "410 U.S. 113"
 
 
 def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
@@ -115,7 +119,7 @@ def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
                 )
 
         assert response.tool_result is not None
-        assert response.tool_result.results.verified[0].citation == "347 U.S. 483"
+        assert response.tool_result.findings[0].citation == "347 U.S. 483"
 
 
 def test_chat_non_trigger_behavior_unchanged(tmp_path) -> None:
