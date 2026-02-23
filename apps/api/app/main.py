@@ -195,14 +195,36 @@ class CitationVerificationFinding(BaseModel):
     explanation: str
 
 
+class CitationVerificationSummary(BaseModel):
+    total: int = 0
+    verified: int = 0
+    not_found: int = 0
+    ambiguous: int = 0
+
+
 class VerifyCitationsResponse(BaseModel):
-    findings: list[CitationVerificationFinding]
+    findings: list[CitationVerificationFinding] = Field(default_factory=list)
+    summary: CitationVerificationSummary = Field(
+        default_factory=CitationVerificationSummary
+    )
+    citations: list[str] = Field(default_factory=list)
     raw: dict[str, Any] | None = None
 
 
 class CitationVerificationToolResult(BaseModel):
     type: str = "citation_verification"
-    findings: list[CitationVerificationFinding]
+    findings: list[CitationVerificationFinding] = Field(default_factory=list)
+    summary: CitationVerificationSummary = Field(
+        default_factory=CitationVerificationSummary
+    )
+    citations: list[str] = Field(default_factory=list)
+
+
+class VerifyExtractedCitationsRequest(BaseModel):
+    text: str
+    doc_id: str | None = None
+    chunk_id: str | None = None
+    include_raw: bool = False
 
 
 @app.get("/health")
@@ -232,8 +254,11 @@ def _run_citation_verification(
         findings = _courtlistener_raw_to_findings(
             cached_raw if isinstance(cached_raw, dict) else {"results": []}
         )
+        summary = _summarize_citation_findings(findings)
         return VerifyCitationsResponse(
             findings=findings,
+            summary=summary,
+            citations=[item.citation for item in findings],
             raw=cached_raw
             if payload.include_raw and isinstance(cached_raw, dict)
             else None,
@@ -246,6 +271,7 @@ def _run_citation_verification(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     findings = _courtlistener_raw_to_findings(raw)
+    summary = _summarize_citation_findings(findings)
     statuses = {item.status for item in findings}
     if not findings or statuses == {"not_found"}:
         summary_status = "not_found"
@@ -268,6 +294,8 @@ def _run_citation_verification(
 
     return VerifyCitationsResponse(
         findings=findings,
+        summary=summary,
+        citations=[item.citation for item in findings],
         raw=raw if payload.include_raw else None,
     )
 
@@ -278,6 +306,299 @@ def verify_citations(
     session: Session = Depends(get_session),
 ) -> VerifyCitationsResponse:
     return _run_citation_verification(payload=payload, session=session)
+
+
+def _normalize_extracted_citation(value: str) -> str:
+    extracted = _extract_citations(value)
+    if extracted:
+        return extracted[0]
+    return _normalize_ws(value).strip(" ,;:.")
+
+
+def _extract_citations(text: str) -> list[str]:
+    prepared = _normalize_ws(text)
+    if not prepared:
+        return []
+
+    patterns: list[tuple[re.Pattern[str], str]] = [
+        (
+            re.compile(
+                r"\b(?P<vol>\d{1,4})\s+U\.?\s*S\.?\s+(?P<page>\d{1,4})\b",
+                flags=re.IGNORECASE,
+            ),
+            "us",
+        ),
+        (
+            re.compile(
+                r"\b(?P<vol>\d{1,4})\s+F\.?\s*(?P<series>[23])d\s+(?P<page>\d{1,4})\b",
+                flags=re.IGNORECASE,
+            ),
+            "f_series",
+        ),
+        (
+            re.compile(
+                r"\b(?P<vol>\d{1,4})\s+F\.?\s*Supp\.?\s*(?:(?P<series>[23])d\s+)?(?P<page>\d{1,4})\b",
+                flags=re.IGNORECASE,
+            ),
+            "f_supp",
+        ),
+        (
+            re.compile(
+                r"\b(?P<vol>\d{1,4})\s+F\.?\s+(?P<page>\d{1,4})\b",
+                flags=re.IGNORECASE,
+            ),
+            "f",
+        ),
+        (
+            re.compile(
+                r"\b(?P<vol>\d{1,4})\s+S\.?\s*Ct\.?\s+(?P<page>\d{1,4})\b",
+                flags=re.IGNORECASE,
+            ),
+            "s_ct",
+        ),
+    ]
+
+    found: dict[str, str] = {}
+    for pattern, pattern_name in patterns:
+        for match in pattern.finditer(prepared):
+            vol = match.group("vol")
+            page = match.group("page")
+            if pattern_name == "us":
+                citation = f"{vol} U.S. {page}"
+            elif pattern_name == "f_series":
+                citation = f"{vol} F.{match.group('series')}d {page}"
+            elif pattern_name == "f_supp":
+                series = match.groupdict().get("series")
+                citation = (
+                    f"{vol} F. Supp. {series}d {page}"
+                    if series
+                    else f"{vol} F. Supp. {page}"
+                )
+            elif pattern_name == "f":
+                citation = f"{vol} F. {page}"
+            else:
+                citation = f"{vol} S. Ct. {page}"
+            citation_key = _normalize_citation_string(citation)
+            if citation_key and citation_key not in found:
+                found[citation_key] = citation
+
+    return [found[key] for key in sorted(found)]
+
+
+def _extract_citations_from_chunks(
+    chunks: list[dict[str, object]], max_chars: int = 8000
+) -> list[str]:
+    def _chunk_order_key(chunk: dict[str, object]) -> tuple[str, str, int, float]:
+        raw_page = chunk.get("page")
+        try:
+            page = int(raw_page) if raw_page is not None else -1
+        except (TypeError, ValueError):
+            page = -1
+        raw_score = chunk.get("score")
+        try:
+            score = float(raw_score) if raw_score is not None else 0.0
+        except (TypeError, ValueError):
+            score = 0.0
+        return (
+            str(chunk.get("doc_id") or ""),
+            str(chunk.get("chunk_id") or ""),
+            page,
+            -score,
+        )
+
+    ordered_chunks = sorted(chunks, key=_chunk_order_key)
+    parts: list[str] = []
+    total_chars = 0
+    for chunk in ordered_chunks:
+        chunk_text = _normalize_ws(str(chunk.get("text", "") or ""))
+        if not chunk_text:
+            continue
+        if total_chars >= max_chars:
+            break
+
+        remaining = max_chars - total_chars
+        piece = chunk_text[:remaining].rstrip()
+        if not piece:
+            continue
+        parts.append(piece)
+        total_chars += len(piece)
+        if len(piece) < len(chunk_text):
+            break
+        total_chars += 2
+
+    return _extract_citations("\n\n".join(parts))
+
+
+def _normalize_citation_list(citations: list[str]) -> list[str]:
+    deduped: dict[str, str] = {}
+    for citation in citations:
+        normalized = _normalize_extracted_citation(citation)
+        key = _normalize_citation_string(normalized)
+        if key and key not in deduped:
+            deduped[key] = normalized
+    return [deduped[key] for key in sorted(deduped)]
+
+
+def _citation_list_hash(citations: list[str]) -> str:
+    normalized = _normalize_citation_list(citations)
+    return sha256("|".join(normalized).encode("utf-8")).hexdigest()
+
+
+def _extract_results_list(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    results_source: Any = entry.get("results")
+    if not isinstance(results_source, list):
+        for key in ("clusters", "matches", "opinions"):
+            candidate = entry.get(key)
+            if isinstance(candidate, list):
+                results_source = candidate
+                break
+        else:
+            results_source = []
+    normalized_results = [_as_result_item(item) for item in results_source]
+    normalized_results.sort(key=_stable_json_key)
+    return normalized_results
+
+
+def _extract_citation_entries(raw: dict[str, Any]) -> list[dict[str, Any]]:
+    entries_obj: Any
+    if isinstance(raw.get("results"), list):
+        entries_obj = raw.get("results")
+    elif isinstance(raw.get("citations"), list):
+        entries_obj = raw.get("citations")
+    else:
+        entries_obj = []
+    entries = entries_obj if isinstance(entries_obj, list) else []
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def _merge_citation_lookup_raw_batches(
+    raw_batches: list[dict[str, Any]],
+) -> dict[str, Any]:
+    merged_entries: list[dict[str, Any]] = []
+    for raw in raw_batches:
+        for entry in _extract_citation_entries(raw):
+            merged_entries.append(entry)
+    merged_entries.sort(
+        key=lambda entry: (
+            _normalize_citation_string(
+                str(
+                    entry.get("citation")
+                    or entry.get("cite")
+                    or entry.get("normalized_citation")
+                    or entry.get("text")
+                    or ""
+                )
+            ),
+            _stable_json_key(entry),
+        )
+    )
+    return {"results": merged_entries}
+
+
+def _summarize_citation_findings(
+    findings: list[CitationVerificationFinding],
+) -> CitationVerificationSummary:
+    summary = CitationVerificationSummary(total=len(findings))
+    for finding in findings:
+        if finding.status == "verified":
+            summary.verified += 1
+        elif finding.status == "ambiguous":
+            summary.ambiguous += 1
+        else:
+            summary.not_found += 1
+    return summary
+
+
+def _run_citation_verification_for_citations(
+    citations: list[str],
+    session: Session,
+    include_raw: bool = False,
+    doc_id: str | None = None,
+    chunk_id: str | None = None,
+    batch_size: int = 25,
+) -> VerifyCitationsResponse:
+    normalized_citations = _normalize_citation_list(citations)
+    if not normalized_citations:
+        return VerifyCitationsResponse()
+
+    input_hash = _citation_list_hash(normalized_citations)
+    cached = session.exec(
+        select(CitationVerification).where(
+            CitationVerification.input_hash == input_hash
+        )
+    ).first()
+    if cached is not None:
+        try:
+            cached_raw = json.loads(cached.raw_json)
+        except json.JSONDecodeError:
+            cached_raw = {"results": []}
+        findings = _courtlistener_raw_to_findings(
+            cached_raw if isinstance(cached_raw, dict) else {"results": []},
+            requested_citations=normalized_citations,
+        )
+        return VerifyCitationsResponse(
+            findings=findings,
+            summary=_summarize_citation_findings(findings),
+            citations=normalized_citations,
+            raw=cached_raw if include_raw and isinstance(cached_raw, dict) else None,
+        )
+
+    client = CourtListenerClient()
+    raw_batches: list[dict[str, Any]] = []
+    for batch_start in range(0, len(normalized_citations), max(1, batch_size)):
+        batch = normalized_citations[batch_start : batch_start + max(1, batch_size)]
+        try:
+            batch_raw = client.lookup_citation_list(batch)
+        except CourtListenerError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        raw_batches.append(
+            batch_raw if isinstance(batch_raw, dict) else {"results": []}
+        )
+
+    merged_raw = _merge_citation_lookup_raw_batches(raw_batches)
+    findings = _courtlistener_raw_to_findings(
+        merged_raw,
+        requested_citations=normalized_citations,
+    )
+    summary = _summarize_citation_findings(findings)
+    if summary.total == 0 or summary.not_found == summary.total:
+        summary_status = "not_found"
+    elif summary.verified == summary.total:
+        summary_status = "verified"
+    else:
+        summary_status = "ambiguous"
+
+    record = CitationVerification(
+        input_hash=input_hash,
+        doc_id=doc_id,
+        chunk_id=chunk_id,
+        raw_json=json.dumps(merged_raw, sort_keys=True),
+        summary_status=summary_status,
+    )
+    session.add(record)
+    session.commit()
+
+    return VerifyCitationsResponse(
+        findings=findings,
+        summary=summary,
+        citations=normalized_citations,
+        raw=merged_raw if include_raw else None,
+    )
+
+
+@app.post("/verify/citations/extracted", response_model=VerifyCitationsResponse)
+def verify_citations_extracted(
+    payload: VerifyExtractedCitationsRequest,
+    session: Session = Depends(get_session),
+) -> VerifyCitationsResponse:
+    citations = _extract_citations(payload.text)
+    return _run_citation_verification_for_citations(
+        citations=citations,
+        session=session,
+        include_raw=payload.include_raw,
+        doc_id=payload.doc_id,
+        chunk_id=payload.chunk_id,
+    )
 
 
 def _document_response_from_row(row: Document) -> DocumentResponse:
@@ -1409,13 +1730,21 @@ def _build_verification_text_from_chunks(
 
 def _citation_verification_answer(result: VerifyCitationsResponse) -> str:
     if not result.findings:
-        return "Citation verification completed. No citations were recognized."
+        return "Citation verification requested, but no citations were detected."
 
+    summary = result.summary
+    header = (
+        "Citation verification results: "
+        f"{summary.verified} verified, "
+        f"{summary.ambiguous} ambiguous, "
+        f"{summary.not_found} not found "
+        f"(total {summary.total})."
+    )
     lines = [
         f"- {item.citation}: {item.status} (confidence {item.confidence:.2f})"
         for item in result.findings
     ]
-    return "Citation verification results:\n" + "\n".join(lines)
+    return header + "\n" + "\n".join(lines)
 
 
 def _stable_json_key(value: Any) -> str:
@@ -1534,22 +1863,17 @@ def _candidate_sort_key(candidate: dict[str, Any]) -> tuple[str, str, int, str, 
 
 def _courtlistener_raw_to_findings(
     raw: dict[str, Any],
+    requested_citations: list[str] | None = None,
 ) -> list[CitationVerificationFinding]:
-    entries_obj: Any
-    if isinstance(raw.get("results"), list):
-        entries_obj = raw.get("results")
-    elif isinstance(raw.get("citations"), list):
-        entries_obj = raw.get("citations")
-    else:
-        entries_obj = []
-
-    entries = entries_obj if isinstance(entries_obj, list) else []
     by_citation: dict[str, dict[str, Any]] = {}
+    if requested_citations:
+        for requested in requested_citations:
+            key = _normalize_citation_string(requested)
+            if not key or key in by_citation:
+                continue
+            by_citation[key] = {"citation": requested, "results": []}
 
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-
+    for entry in _extract_citation_entries(raw):
         citation = _normalize_ws(
             str(
                 entry.get("citation")
@@ -1562,34 +1886,22 @@ def _courtlistener_raw_to_findings(
         if not citation:
             continue
 
-        results_source: Any = entry.get("results")
-        if not isinstance(results_source, list):
-            for key in ("clusters", "matches", "opinions"):
-                candidate = entry.get(key)
-                if isinstance(candidate, list):
-                    results_source = candidate
-                    break
-            else:
-                results_source = []
-
-        normalized_results = [
-            _as_result_item(result_item) for result_item in results_source
-        ]
-        normalized_results.sort(key=_stable_json_key)
         citation_key = _normalize_citation_string(citation)
         if not citation_key:
+            continue
+        if requested_citations and citation_key not in by_citation:
             continue
 
         existing = by_citation.get(citation_key)
         if existing is None:
             by_citation[citation_key] = {
                 "citation": citation,
-                "results": normalized_results,
+                "results": _extract_results_list(entry),
             }
             continue
 
         merged = {_stable_json_key(item): item for item in existing["results"]}
-        for item in normalized_results:
+        for item in _extract_results_list(entry):
             merged[_stable_json_key(item)] = item
         existing["results"] = sorted(merged.values(), key=_stable_json_key)
 
@@ -1870,25 +2182,31 @@ def chat(
     ]
     tool_result: CitationVerificationToolResult | None = None
     if _is_citation_verification_request(message):
-        verification_text = _extract_message_verification_text(message)
-        if verification_text is None:
-            verification_text = _build_verification_text_from_chunks(rows)
-
-        if verification_text:
-            verification_response = _run_citation_verification(
-                payload=VerifyCitationsRequest(
-                    text=verification_text,
-                    doc_id=str(payload.doc_id),
-                ),
+        message_text = _extract_message_verification_text(message)
+        citations = (
+            _extract_citations(message_text)
+            if message_text is not None
+            else _extract_citations_from_chunks(rows)
+        )
+        if citations:
+            verification_response = _run_citation_verification_for_citations(
+                citations=citations,
                 session=session,
+                doc_id=str(payload.doc_id),
             )
             answer = _citation_verification_answer(verification_response)
             tool_result = CitationVerificationToolResult(
-                findings=verification_response.findings
+                findings=verification_response.findings,
+                summary=verification_response.summary,
+                citations=verification_response.citations,
             )
         else:
-            answer = (
-                "Citation verification requested, but no citation text was available."
+            verification_response = VerifyCitationsResponse()
+            answer = "Citation verification requested, but no citations were detected."
+            tool_result = CitationVerificationToolResult(
+                findings=verification_response.findings,
+                summary=verification_response.summary,
+                citations=verification_response.citations,
             )
         findings: list[ChatFinding] = []
     else:
@@ -1959,22 +2277,30 @@ def chat_project(
     ]
     tool_result: CitationVerificationToolResult | None = None
     if _is_citation_verification_request(message):
-        verification_text = _extract_message_verification_text(message)
-        if verification_text is None:
-            verification_text = _build_verification_text_from_chunks(rows)
-
-        if verification_text:
-            verification_response = _run_citation_verification(
-                payload=VerifyCitationsRequest(text=verification_text),
+        message_text = _extract_message_verification_text(message)
+        citations = (
+            _extract_citations(message_text)
+            if message_text is not None
+            else _extract_citations_from_chunks(rows)
+        )
+        if citations:
+            verification_response = _run_citation_verification_for_citations(
+                citations=citations,
                 session=session,
             )
             answer = _citation_verification_answer(verification_response)
             tool_result = CitationVerificationToolResult(
-                findings=verification_response.findings
+                findings=verification_response.findings,
+                summary=verification_response.summary,
+                citations=verification_response.citations,
             )
         else:
-            answer = (
-                "Citation verification requested, but no citation text was available."
+            verification_response = VerifyCitationsResponse()
+            answer = "Citation verification requested, but no citations were detected."
+            tool_result = CitationVerificationToolResult(
+                findings=verification_response.findings,
+                summary=verification_response.summary,
+                citations=verification_response.citations,
             )
         findings: list[ChatFinding] = []
     else:

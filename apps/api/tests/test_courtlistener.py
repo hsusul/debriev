@@ -14,8 +14,13 @@ from app.courtlistener import CourtListenerClient, CourtListenerError
 from app.db import CitationVerification
 from app.main import (
     VerifyCitationsRequest,
+    VerifyExtractedCitationsRequest,
+    _extract_citations,
+    _extract_citations_from_chunks,
+    _run_citation_verification_for_citations,
     _courtlistener_raw_to_findings,
     verify_citations,
+    verify_citations_extracted,
 )
 
 
@@ -105,6 +110,13 @@ def test_verify_citations_is_deterministic_and_sorted(tmp_path: Path) -> None:
         "verified",
         "ambiguous",
     ]
+    assert first["summary"] == {
+        "total": 3,
+        "verified": 1,
+        "not_found": 1,
+        "ambiguous": 1,
+    }
+    assert first["citations"] == ["123 F.3d 456", "347 U.S. 483", "410 U.S. 113"]
     assert first["findings"][0]["confidence"] == 0.0
     assert first["findings"][1]["confidence"] == 1.0
     assert first["findings"][2]["confidence"] == 0.5
@@ -150,6 +162,8 @@ def test_verify_citations_cache_miss_stores_record(tmp_path: Path) -> None:
         assert mock_lookup.call_count == 1
         assert response["findings"][0]["citation"] == "410 U.S. 113"
         assert response["findings"][0]["status"] == "verified"
+        assert response["summary"]["verified"] == 1
+        assert response["citations"] == ["410 U.S. 113"]
 
         rows = session.exec(select(CitationVerification)).all()
         assert len(rows) == 1
@@ -184,6 +198,7 @@ def test_verify_citations_cache_hit_skips_client(tmp_path: Path) -> None:
             response = verify_citations(payload, session=session).model_dump()
 
     assert response["findings"][0]["citation"] == "410 U.S. 113"
+    assert response["summary"]["total"] == 1
 
 
 def test_verify_citations_repeated_calls_are_identical(tmp_path: Path) -> None:
@@ -273,3 +288,107 @@ def test_courtlistener_raw_to_findings_ambiguous_is_deterministic() -> None:
     assert first[0].confidence == 0.5
     assert first[0].best_match is not None
     assert first[0].best_match.case_name == "Alpha v. Bravo"
+
+
+def test_extract_citations_dedupes_and_orders_deterministically() -> None:
+    text = """
+    The opinion cites 410 U.S. 113, 123 F.3d 456, and 12 F. Supp. 2d 345.
+    It also repeats 410  U.S. 113 and includes 600 S. Ct. 12.
+    """
+    extracted = _extract_citations(text)
+    assert extracted == [
+        "12 F. Supp. 2d 345",
+        "123 F.3d 456",
+        "410 U.S. 113",
+        "600 S. Ct. 12",
+    ]
+
+
+def test_extract_citations_from_chunks_uses_chunk_text() -> None:
+    chunks = [
+        {
+            "doc_id": "doc-b",
+            "chunk_id": "chunk-2",
+            "text": "Mentions 600 S. Ct. 12.",
+        },
+        {
+            "doc_id": "doc-a",
+            "chunk_id": "chunk-1",
+            "text": "Contains 410 U.S. 113 and 123 F.3d 456.",
+        },
+    ]
+    assert _extract_citations_from_chunks(chunks) == [
+        "123 F.3d 456",
+        "410 U.S. 113",
+        "600 S. Ct. 12",
+    ]
+
+
+def test_run_citation_verification_for_citations_batches_and_cache(
+    tmp_path: Path,
+) -> None:
+    citations = [f"{idx} U.S. {100 + idx}" for idx in range(1, 31)]
+    call_batches: list[list[str]] = []
+
+    def _mock_lookup(_self: object, citation_batch: list[str]) -> dict[str, Any]:
+        call_batches.append(list(citation_batch))
+        return {
+            "results": [
+                {
+                    "citation": citation,
+                    "results": [
+                        {"citation": citation, "case_name": f"Case {citation}"}
+                    ],
+                }
+                for citation in citation_batch
+            ]
+        }
+
+    with _make_session(tmp_path) as session:
+        with patch("app.main.CourtListenerClient.lookup_citation_list", _mock_lookup):
+            first = _run_citation_verification_for_citations(
+                citations=citations,
+                session=session,
+                batch_size=25,
+            ).model_dump()
+
+        assert len(call_batches) == 2
+        assert len(call_batches[0]) == 25
+        assert len(call_batches[1]) == 5
+        assert first["summary"]["total"] == 30
+        assert first["summary"]["verified"] == 30
+
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            side_effect=AssertionError("cache hit should not call lookup"),
+        ):
+            second = _run_citation_verification_for_citations(
+                citations=list(reversed(citations)),
+                session=session,
+                batch_size=25,
+            ).model_dump()
+
+    assert first == second
+
+
+def test_verify_citations_extracted_endpoint_returns_summary(tmp_path: Path) -> None:
+    payload = VerifyExtractedCitationsRequest(text="See 410 U.S. 113 and 123 F.3d 456.")
+    mock_lookup = Mock(
+        return_value={
+            "results": [
+                {"citation": "410 U.S. 113", "results": [{"citation": "410 U.S. 113"}]},
+                {"citation": "123 F.3d 456", "results": []},
+            ]
+        }
+    )
+    with _make_session(tmp_path) as session:
+        with patch("app.main.CourtListenerClient.lookup_citation_list", mock_lookup):
+            response = verify_citations_extracted(payload, session=session).model_dump()
+
+    assert response["citations"] == ["123 F.3d 456", "410 U.S. 113"]
+    assert response["summary"] == {
+        "total": 2,
+        "verified": 1,
+        "not_found": 1,
+        "ambiguous": 0,
+    }

@@ -67,3 +67,11 @@ class CourtListenerClient:
         if isinstance(parsed, list):
             return {"results": parsed}
         return {"results": [parsed]}
+
+    def lookup_citation_list(self, citations: list[str]) -> dict:
+        cleaned_citations = [
+            citation.strip() for citation in citations if citation.strip()
+        ]
+        if not cleaned_citations:
+            raise CourtListenerError("Citation list must be non-empty")
+        return self.lookup_citations("\n".join(cleaned_citations))

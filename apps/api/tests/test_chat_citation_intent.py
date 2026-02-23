@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from hashlib import sha256
 import json
 from uuid import uuid4
 
@@ -10,10 +9,10 @@ from unittest.mock import Mock, patch
 from app.db import CitationVerification, Document
 from app.main import (
     CitationVerificationFinding,
+    CitationVerificationSummary,
     ChatRequest,
     VerifyCitationsResponse,
-    _build_verification_text_from_chunks,
-    _normalize_ws,
+    _citation_list_hash,
     chat,
 )
 
@@ -61,21 +60,30 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
                     best_match=None,
                     explanation="One CourtListener match was returned with an exact citation match.",
                 )
-            ]
+            ],
+            summary=CitationVerificationSummary(
+                total=1, verified=1, not_found=0, ambiguous=0
+            ),
+            citations=["410 U.S. 113"],
         )
         mock_verify = Mock(return_value=verification)
 
         with patch("app.main.query_document_chunks", return_value=rows):
-            with patch("app.main._run_citation_verification", mock_verify):
+            with patch(
+                "app.main._run_citation_verification_for_citations", mock_verify
+            ):
                 response = chat(
                     ChatRequest(doc_id=doc_id, message="Please verify citations"),
                     session=session,
                 )
 
         assert mock_verify.call_count == 1
+        assert mock_verify.call_args.kwargs["citations"] == ["410 U.S. 113"]
         assert response.tool_result is not None
         assert response.tool_result.type == "citation_verification"
         assert response.tool_result.findings[0].citation == "410 U.S. 113"
+        assert response.tool_result.summary.total == 1
+        assert response.tool_result.citations == ["410 U.S. 113"]
 
 
 def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
@@ -90,10 +98,7 @@ def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
                 "score": 0.8,
             }
         ]
-        verification_text = _build_verification_text_from_chunks(rows)
-        input_hash = sha256(
-            _normalize_ws(verification_text).encode("utf-8")
-        ).hexdigest()
+        input_hash = _citation_list_hash(["347 U.S. 483"])
         raw_payload = {
             "results": [{"citation": "347 U.S. 483", "results": [{"id": 2}]}]
         }
@@ -110,7 +115,7 @@ def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
 
         with patch("app.main.query_document_chunks", return_value=rows):
             with patch(
-                "app.main.CourtListenerClient.lookup_citations",
+                "app.main.CourtListenerClient.lookup_citation_list",
                 side_effect=AssertionError("lookup should not be called on cache hit"),
             ):
                 response = chat(
@@ -120,6 +125,36 @@ def test_chat_citation_intent_uses_cache_on_hit(tmp_path) -> None:
 
         assert response.tool_result is not None
         assert response.tool_result.findings[0].citation == "347 U.S. 483"
+        assert response.tool_result.summary.verified == 1
+        assert response.tool_result.citations == ["347 U.S. 483"]
+
+
+def test_chat_citation_intent_no_citations_detected(tmp_path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = _insert_document(session)
+        rows = [
+            {
+                "chunk_id": "chunk-none",
+                "text": "This chunk has no legal citation text.",
+                "page": 1,
+                "score": 0.7,
+            }
+        ]
+
+        with patch("app.main.query_document_chunks", return_value=rows):
+            with patch(
+                "app.main._run_citation_verification_for_citations",
+                side_effect=AssertionError("should not verify when no citations found"),
+            ):
+                response = chat(
+                    ChatRequest(doc_id=doc_id, message="verify citations"),
+                    session=session,
+                )
+
+        assert response.tool_result is not None
+        assert response.tool_result.findings == []
+        assert response.tool_result.summary.total == 0
+        assert response.tool_result.citations == []
 
 
 def test_chat_non_trigger_behavior_unchanged(tmp_path) -> None:
