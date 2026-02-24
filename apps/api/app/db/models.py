@@ -101,5 +101,6 @@ class VerificationJob(SQLModel, table=True):
     status: str = Field(default="queued", sa_column=Column(String(16), nullable=False))
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    input_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     error_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     result_id: int | None = Field(default=None, index=True)

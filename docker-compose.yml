@@ -1,0 +1,74 @@
+services:
+  api:
+    image: python:3.13-slim
+    working_dir: /workspace/apps/api
+    command: >
+      sh -c "pip install --no-cache-dir -e . &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    volumes:
+      - .:/workspace
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./app.db}
+      COURTLISTENER_TOKEN: ${COURTLISTENER_TOKEN:-}
+      DEV_AUTO_MIGRATE: ${DEV_AUTO_MIGRATE:-false}
+      VERIFICATION_WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-2}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+
+  worker:
+    image: python:3.13-slim
+    working_dir: /workspace/apps/api
+    command: >
+      sh -c "pip install --no-cache-dir -e . &&
+      python -m app.worker --poll-seconds ${WORKER_POLL_SECONDS:-2}"
+    volumes:
+      - .:/workspace
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///./app.db}
+      COURTLISTENER_TOKEN: ${COURTLISTENER_TOKEN:-}
+      DEV_AUTO_MIGRATE: ${DEV_AUTO_MIGRATE:-false}
+      VERIFICATION_WORKER_POLL_SECONDS: ${WORKER_POLL_SECONDS:-2}
+    depends_on:
+      api:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+        required: false
+
+  web:
+    image: node:20
+    working_dir: /workspace/apps/web
+    command: sh -c "npm install && npm run dev -- --hostname 0.0.0.0 --port 3000"
+    volumes:
+      - .:/workspace
+    environment:
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_started
+
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-debriev}
+      POSTGRES_USER: ${POSTGRES_USER:-debriev}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-debriev}
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-debriev} -d ${POSTGRES_DB:-debriev}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:

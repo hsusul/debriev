@@ -42,10 +42,13 @@ from app.main import (
     create_verification_job,
     export_report_pdf,
     get_report_citations,
+    get_report_overview,
     get_report_risk,
+    get_report_verification_by_id,
     get_report_verification_history,
     get_verification_job_status,
     get_report_verification,
+    metrics_simple,
     verify_citations,
     verify_citations_extracted,
 )
@@ -329,6 +332,44 @@ def test_verify_citations_repeated_calls_are_identical(tmp_path: Path) -> None:
 
     assert mock_lookup.call_count == 1
     assert first == second
+
+
+def test_metrics_counters_increment_for_verification_paths(tmp_path: Path) -> None:
+    before = metrics_simple()
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973).",
+        doc_id=str(uuid4()),
+    )
+
+    with _make_session(tmp_path) as session:
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            return_value={
+                "results": [
+                    {
+                        "citation": "410 U.S. 113",
+                        "results": [{"citation": "410 U.S. 113"}],
+                    }
+                ]
+            },
+        ):
+            verify_citations_extracted(payload, session=session)
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            side_effect=AssertionError("cache hit should avoid lookup"),
+        ):
+            verify_citations_extracted(payload, session=session)
+
+    after = metrics_simple()
+    assert set(after) == {
+        "cache_hits_total",
+        "courtlistener_calls_total",
+        "courtlistener_errors_total",
+        "verify_requests_total",
+    }
+    assert after["verify_requests_total"] >= before["verify_requests_total"] + 2
+    assert after["courtlistener_calls_total"] >= before["courtlistener_calls_total"] + 1
+    assert after["cache_hits_total"] >= before["cache_hits_total"] + 1
 
 
 def test_courtlistener_raw_to_findings_not_found() -> None:
@@ -660,6 +701,48 @@ def test_get_report_verification_returns_latest_stored_result(tmp_path: Path) ->
     assert result["summary"] == {
         "total": 2,
         "verified": 1,
+        "not_found": 1,
+        "ambiguous": 0,
+    }
+
+
+def test_get_report_verification_by_id_returns_specific_run(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    payload_first = VerifyExtractedCitationsRequest(
+        text="See Roe v. Wade, 410 U.S. 113.",
+        doc_id=doc_id,
+    )
+    payload_second = VerifyExtractedCitationsRequest(
+        text="See Roe v. Wade, 410 U.S. 113 and 123 F.3d 456.",
+        doc_id=doc_id,
+    )
+    mock_lookup = Mock(
+        side_effect=[
+            {"results": [{"citation": "410 U.S. 113", "results": []}]},
+            {
+                "results": [
+                    {"citation": "410 U.S. 113", "results": []},
+                    {"citation": "123 F.3d 456", "results": []},
+                ]
+            },
+        ]
+    )
+
+    with _make_session(tmp_path) as session:
+        with patch("app.main.CourtListenerClient.lookup_citation_list", mock_lookup):
+            verify_citations_extracted(payload_first, session=session)
+            verify_citations_extracted(payload_second, session=session)
+
+        history = get_report_verification_history(doc_id=UUID(doc_id), session=session)
+        older = history[1]
+        run = get_report_verification_by_id(
+            doc_id=UUID(doc_id), result_id=older.id, session=session
+        ).model_dump()
+
+    assert run["citations"] == ["410 U.S. 113"]
+    assert run["summary"] == {
+        "total": 1,
+        "verified": 0,
         "not_found": 1,
         "ambiguous": 0,
     }
@@ -1040,3 +1123,89 @@ def test_export_report_pdf_returns_pdf_and_is_deterministic(
     assert second.media_type == "application/pdf"
     assert first.body == second.body
     assert first.body.startswith(b"%PDF-1.4")
+
+
+def test_report_overview_returns_expected_shape_when_data_exists(
+    tmp_path: Path,
+) -> None:
+    doc_id = str(uuid4())
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973). Brown v. Board, 347 U.S. 483 (1954).",
+        doc_id=doc_id,
+    )
+    mock_lookup = Mock(
+        return_value={
+            "results": [
+                {"citation": "347 U.S. 483", "results": []},
+                {"citation": "410 U.S. 113", "results": [{"citation": "410 U.S. 113"}]},
+            ]
+        }
+    )
+    bogus_findings = [
+        ChatFinding(
+            case_name="Example v. Fake",
+            reason_label="appears_fake",
+            reason_phrase="appear to be fake",
+            evidence="Example v. Fake appears to be fake.",
+            doc_id=doc_id,
+            chunk_id="chunk-1",
+        )
+    ]
+
+    with _make_session(tmp_path) as session:
+        session.add(
+            Document(
+                doc_id=UUID(doc_id),
+                filename="fixture.pdf",
+                file_path="/tmp/fixture.pdf",
+                stub_text="Example text",
+            )
+        )
+        session.commit()
+
+        with patch("app.main.CourtListenerClient.lookup_citation_list", mock_lookup):
+            verify_citations_extracted(payload, session=session)
+        with patch("app.main._get_bogus_findings_for_doc", return_value=bogus_findings):
+            first = get_report_overview(
+                doc_id=UUID(doc_id), session=session
+            ).model_dump()
+            second = get_report_overview(
+                doc_id=UUID(doc_id), session=session
+            ).model_dump()
+
+    assert first == second
+    assert str(first["doc_id"]) == doc_id
+    assert first["extracted_citations"] is not None
+    assert first["latest_verification"] is not None
+    assert first["risk_report"] is not None
+    assert first["bogus_findings"] == [bogus_findings[0].model_dump()]
+    assert first["verification_history"]
+    assert first["latest_verification"]["citations"] == ["347 U.S. 483", "410 U.S. 113"]
+    assert first["export_endpoints"] == {
+        "pdf_url": f"/reports/{doc_id}/export.pdf",
+        "json_client": True,
+        "markdown_client": True,
+    }
+
+
+def test_report_overview_returns_partial_data_gracefully(tmp_path: Path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = uuid4()
+        session.add(
+            Document(
+                doc_id=doc_id,
+                filename="empty.pdf",
+                file_path="/tmp/empty.pdf",
+                stub_text="",
+            )
+        )
+        session.commit()
+
+        overview = get_report_overview(doc_id=doc_id, session=session).model_dump()
+
+    assert str(overview["doc_id"]) == str(doc_id)
+    assert overview["extracted_citations"] is None
+    assert overview["latest_verification"] is None
+    assert overview["risk_report"] is None
+    assert overview["bogus_findings"] == []
+    assert overview["verification_history"] == []

@@ -6,11 +6,14 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from io import BytesIO
 import json
+import logging
 import os
 from pathlib import Path
 import re
+from threading import Lock
+import time
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import (
     BackgroundTasks,
@@ -19,6 +22,7 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
@@ -66,6 +70,54 @@ from app.db.session import engine
 from app.settings import settings
 
 
+logger = logging.getLogger("debriev.api")
+if not logger.handlers:  # pragma: no cover - environment dependent
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+_METRICS_LOCK = Lock()
+_METRICS_COUNTERS: dict[str, int] = {
+    "verify_requests_total": 0,
+    "courtlistener_calls_total": 0,
+    "courtlistener_errors_total": 0,
+    "cache_hits_total": 0,
+}
+
+
+def _increment_metric(name: str, amount: int = 1) -> None:
+    with _METRICS_LOCK:
+        _METRICS_COUNTERS[name] = _METRICS_COUNTERS.get(name, 0) + amount
+
+
+def _metrics_snapshot() -> dict[str, int]:
+    with _METRICS_LOCK:
+        return {
+            name: _METRICS_COUNTERS.get(name, 0) for name in sorted(_METRICS_COUNTERS)
+        }
+
+
+def _maybe_run_dev_auto_migrate() -> None:
+    if not settings.dev_auto_migrate:
+        return
+
+    try:
+        from alembic import command
+        from alembic.config import Config
+    except Exception as exc:  # pragma: no cover - env-dependent import
+        raise RuntimeError(
+            "DEV_AUTO_MIGRATE=true requires alembic to be installed"
+        ) from exc
+
+    api_root = Path(__file__).resolve().parents[1]
+    alembic_ini = api_root / "alembic.ini"
+    if not alembic_ini.is_file():
+        raise RuntimeError(f"Alembic config not found: {alembic_ini}")
+
+    alembic_cfg = Config(str(alembic_ini))
+    alembic_cfg.set_main_option("script_location", str(api_root / "alembic"))
+    alembic_cfg.set_main_option("sqlalchemy.url", settings.database_url)
+    command.upgrade(alembic_cfg, "head")
+
+
 def _reap_stale_verification_jobs(session: Session, *, stale_minutes: int = 15) -> int:
     cutoff = datetime.now(UTC) - timedelta(minutes=max(1, stale_minutes))
     cutoff_naive = cutoff.replace(tzinfo=None)
@@ -96,6 +148,7 @@ def _reap_stale_verification_jobs(session: Session, *, stale_minutes: int = 15) 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
+    _maybe_run_dev_auto_migrate()
     init_db()
     init_retrieval_db(settings.retrieval_db_path)
     with Session(engine) as startup_session:
@@ -119,6 +172,48 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or uuid4().hex
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+        logger.exception(
+            json.dumps(
+                {
+                    "event": "request",
+                    "latency_ms": elapsed_ms,
+                    "method": request.method,
+                    "path": request.url.path,
+                    "request_id": request_id,
+                    "status": 500,
+                },
+                sort_keys=True,
+            )
+        )
+        raise
+
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 3)
+    response.headers["x-request-id"] = request_id
+    logger.info(
+        json.dumps(
+            {
+                "event": "request",
+                "latency_ms": elapsed_ms,
+                "method": request.method,
+                "path": request.url.path,
+                "request_id": request_id,
+                "status": response.status_code,
+            },
+            sort_keys=True,
+        )
+    )
+    return response
+
 
 try:  # pragma: no cover - optional dependency for file uploads
     import python_multipart  # type: ignore # noqa: F401
@@ -319,6 +414,22 @@ class VerificationWithRiskResponse(BaseModel):
     risk: RiskReport
 
 
+class ReportOverviewExportEndpoints(BaseModel):
+    pdf_url: str
+    json_client: bool = True
+    markdown_client: bool = True
+
+
+class ReportOverviewResponse(BaseModel):
+    doc_id: UUID
+    extracted_citations: ExtractedCitationsResponse | None = None
+    latest_verification: VerifyCitationsResponse | None = None
+    risk_report: RiskReport | None = None
+    bogus_findings: list[ChatFinding] = Field(default_factory=list)
+    verification_history: list[VerificationHistoryItem] = Field(default_factory=list)
+    export_endpoints: ReportOverviewExportEndpoints
+
+
 class VerificationHistoryItem(BaseModel):
     id: int
     created_at: datetime
@@ -349,10 +460,16 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/metrics/simple")
+def metrics_simple() -> dict[str, int]:
+    return _metrics_snapshot()
+
+
 def _run_citation_verification(
     payload: VerifyCitationsRequest,
     session: Session,
 ) -> VerifyCitationsResponse:
+    _increment_metric("verify_requests_total")
     normalized_text = _normalize_ws(payload.text)
     if not normalized_text:
         raise HTTPException(status_code=400, detail="text is required")
@@ -364,6 +481,7 @@ def _run_citation_verification(
         )
     ).first()
     if cached is not None:
+        _increment_metric("cache_hits_total")
         try:
             cached_raw = json.loads(cached.raw_json)
         except json.JSONDecodeError:
@@ -383,8 +501,10 @@ def _run_citation_verification(
 
     client = CourtListenerClient()
     try:
+        _increment_metric("courtlistener_calls_total")
         raw = client.lookup_citations(normalized_text)
     except CourtListenerError as exc:
+        _increment_metric("courtlistener_errors_total")
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     findings = _courtlistener_raw_to_findings(raw)
@@ -906,6 +1026,7 @@ def _run_citation_verification_for_citations(
     evidence_by_citation: dict[str, str] | None = None,
     probable_case_name_by_citation: dict[str, str | None] | None = None,
 ) -> VerifyCitationsResponse:
+    _increment_metric("verify_requests_total")
     normalized_citations = _normalize_citation_list(citations)
     if not normalized_citations:
         return VerifyCitationsResponse()
@@ -941,6 +1062,7 @@ def _run_citation_verification_for_citations(
         )
     ).first()
     if cached is not None:
+        _increment_metric("cache_hits_total")
         try:
             cached_raw = json.loads(cached.raw_json)
         except json.JSONDecodeError:
@@ -963,8 +1085,10 @@ def _run_citation_verification_for_citations(
     for batch_start in range(0, len(normalized_citations), max(1, batch_size)):
         batch = normalized_citations[batch_start : batch_start + max(1, batch_size)]
         try:
+            _increment_metric("courtlistener_calls_total")
             batch_raw = client.lookup_citation_list(batch)
         except CourtListenerError as exc:
+            _increment_metric("courtlistener_errors_total")
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         raw_batches.append(
             batch_raw if isinstance(batch_raw, dict) else {"results": []}
@@ -1239,9 +1363,10 @@ def _execute_verification_job(job_id: str, text: str | None, session: Session) -
 
     try:
         doc_uuid = UUID(job.doc_id)
+        job_text = text if text is not None else job.input_text
         verification_text = (
-            _normalize_ws(text or "")
-            if text is not None and _normalize_ws(text)
+            _normalize_ws(job_text or "")
+            if job_text is not None and _normalize_ws(job_text)
             else _build_doc_verification_text(session=session, doc_id=doc_uuid)
         )
         _run_extracted_verification(
@@ -1341,24 +1466,12 @@ def _verification_response_from_result(
     )
 
 
-@app.get("/reports/{doc_id}/verification", response_model=VerifyCitationsResponse)
-def get_report_verification(
-    doc_id: UUID, session: Session = Depends(get_session)
-) -> VerifyCitationsResponse:
-    stored = get_latest_verification_result(session, doc_id=str(doc_id))
-    if stored is None:
-        raise HTTPException(status_code=404, detail="Verification result not found")
-    return _verification_response_from_result(stored)
-
-
-@app.get(
-    "/reports/{doc_id}/verification/history",
-    response_model=list[VerificationHistoryItem],
-)
-def get_report_verification_history(
-    doc_id: UUID, session: Session = Depends(get_session)
+def _build_verification_history_items(
+    *,
+    session: Session,
+    doc_id: str,
 ) -> list[VerificationHistoryItem]:
-    rows = list_verification_results(session, doc_id=str(doc_id))
+    rows = list_verification_results(session, doc_id=doc_id)
     history: list[VerificationHistoryItem] = []
     for row in rows:
         try:
@@ -1380,6 +1493,43 @@ def get_report_verification_history(
         )
     history.sort(key=lambda item: (item.created_at, item.id), reverse=True)
     return history
+
+
+@app.get("/reports/{doc_id}/verification", response_model=VerifyCitationsResponse)
+def get_report_verification(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> VerifyCitationsResponse:
+    stored = get_latest_verification_result(session, doc_id=str(doc_id))
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Verification result not found")
+    return _verification_response_from_result(stored)
+
+
+@app.get(
+    "/reports/{doc_id}/verification/history",
+    response_model=list[VerificationHistoryItem],
+)
+def get_report_verification_history(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> list[VerificationHistoryItem]:
+    return _build_verification_history_items(session=session, doc_id=str(doc_id))
+
+
+@app.get(
+    "/reports/{doc_id}/verification/{result_id}",
+    response_model=VerifyCitationsResponse,
+)
+def get_report_verification_by_id(
+    doc_id: UUID,
+    result_id: int,
+    session: Session = Depends(get_session),
+) -> VerifyCitationsResponse:
+    stored = session.exec(
+        select(VerificationResult).where(VerificationResult.id == result_id)
+    ).first()
+    if stored is None or stored.doc_id != str(doc_id):
+        raise HTTPException(status_code=404, detail="Verification result not found")
+    return _verification_response_from_result(stored)
 
 
 def _get_bogus_findings_for_doc(session: Session, doc_id: UUID) -> list[ChatFinding]:
@@ -1515,6 +1665,49 @@ def get_report_verification_with_risk(
     return VerificationWithRiskResponse(verification=verification, risk=risk)
 
 
+@app.get("/reports/{doc_id}/overview", response_model=ReportOverviewResponse)
+def get_report_overview(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> ReportOverviewResponse:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc_id_str = str(doc_id)
+    extracted_citations = _get_persisted_extracted_citations(
+        session=session, doc_id=doc_id_str
+    )
+    stored_verification = get_latest_verification_result(session, doc_id=doc_id_str)
+    latest_verification = (
+        _verification_response_from_result(stored_verification)
+        if stored_verification is not None
+        else None
+    )
+    bogus_findings = _get_bogus_findings_for_doc(session, doc_id)
+    risk_report = (
+        _build_risk_report(
+            verification=latest_verification,
+            bogus_findings=bogus_findings,
+        )
+        if latest_verification is not None
+        else None
+    )
+
+    return ReportOverviewResponse(
+        doc_id=doc_id,
+        extracted_citations=extracted_citations,
+        latest_verification=latest_verification,
+        risk_report=risk_report,
+        bogus_findings=bogus_findings,
+        verification_history=_build_verification_history_items(
+            session=session, doc_id=doc_id_str
+        ),
+        export_endpoints=ReportOverviewExportEndpoints(
+            pdf_url=f"/reports/{doc_id}/export.pdf",
+        ),
+    )
+
+
 @app.get("/reports/{doc_id}/export.pdf")
 def export_report_pdf(
     doc_id: UUID, session: Session = Depends(get_session)
@@ -1616,14 +1809,14 @@ def create_verification_job(
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    job = VerificationJob(doc_id=str(doc_id), status="queued")
+    text_payload = (
+        payload.text.strip() if payload.text and payload.text.strip() else None
+    )
+    job = VerificationJob(doc_id=str(doc_id), status="queued", input_text=text_payload)
     session.add(job)
     session.commit()
     session.refresh(job)
 
-    text_payload = (
-        payload.text.strip() if payload.text and payload.text.strip() else None
-    )
     bind = session.get_bind()
     database_url = str(bind.url) if bind is not None else None
     background_tasks.add_task(

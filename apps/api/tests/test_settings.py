@@ -8,7 +8,11 @@ from app.settings import Settings
 def test_settings_loads_values_from_env_file(tmp_path: Path, monkeypatch) -> None:
     env_file = tmp_path / "test.env"
     env_file.write_text(
-        "DATABASE_URL=sqlite:///./from-env-file.db\nCOURTLISTENER_TOKEN=token-from-file\n",
+        (
+            "DATABASE_URL=sqlite:///./from-env-file.db\n"
+            "COURTLISTENER_TOKEN=token-from-file\n"
+            "DEV_AUTO_MIGRATE=true\n"
+        ),
         encoding="utf-8",
     )
 
@@ -19,3 +23,4 @@ def test_settings_loads_values_from_env_file(tmp_path: Path, monkeypatch) -> Non
 
     assert settings.database_url == "sqlite:///./from-env-file.db"
     assert settings.courtlistener_token == "token-from-file"
+    assert settings.dev_auto_migrate is True

@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     embed_provider: str = "stub"
     openai_api_key: str | None = None
     courtlistener_token: str | None = None
+    dev_auto_migrate: bool = False
+    verification_worker_poll_seconds: float = 2.0
 
 
 settings = Settings()

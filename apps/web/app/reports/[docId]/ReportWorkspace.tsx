@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 
 import VerifyButton from "./VerifyButton";
@@ -70,6 +70,83 @@ type BogusFinding = {
   chunk_id?: string | null;
 };
 
+type RiskTotals = {
+  verified: number;
+  not_found: number;
+  ambiguous: number;
+  bogus: number;
+};
+
+type RiskItem = {
+  citation: string;
+  status: string;
+  bogus_reason: string | null;
+  evidence: string;
+  probable_case_name: string | null;
+  link: string | null;
+};
+
+type RiskReport = {
+  score: number;
+  totals: RiskTotals;
+  top_risks: RiskItem[];
+};
+
+type VerificationHistoryItem = {
+  id: number;
+  created_at: string;
+  summary: CitationVerificationSummary;
+  citations_count: number;
+};
+
+type ReportOverviewExportEndpoints = {
+  pdf_url: string;
+  json_client: boolean;
+  markdown_client: boolean;
+};
+
+type ExtractedCitationsResponse = {
+  citations: string[];
+  evidence: Record<string, string>;
+  probable_case_name: Record<string, string | null>;
+};
+
+type ReportOverviewResponse = {
+  doc_id: string;
+  extracted_citations: ExtractedCitationsResponse | null;
+  latest_verification: VerifyCitationsResponse | null;
+  risk_report: RiskReport | null;
+  bogus_findings: BogusFinding[];
+  verification_history: VerificationHistoryItem[];
+  export_endpoints: ReportOverviewExportEndpoints;
+};
+
+type VerificationJobCreateResponse = {
+  job_id: string;
+  status: "queued" | "running" | "done" | "failed";
+};
+
+type VerificationJobStatusResponse = {
+  job_id: string;
+  doc_id: string;
+  status: "queued" | "running" | "done" | "failed";
+  summary: CitationVerificationSummary | null;
+  error_text: string | null;
+  result_id: number | null;
+};
+
+type StatusFilter = "all" | "verified" | "not_found" | "ambiguous" | "bogus";
+type SortMode = "risk_desc" | "citation_asc";
+
+type CitationRow = {
+  citation: ReportCitation;
+  idx: number;
+  finding: CitationVerificationFinding | null;
+  relatedBogus: boolean;
+  riskItem: RiskItem | null;
+  effectiveStatus: string;
+};
+
 const PUBLIC_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000";
 
 function normalizeWhitespace(value: string): string {
@@ -121,11 +198,47 @@ function buildCounts(citations: ReportCitation[]) {
   return { verified, notFound, errors, unverified };
 }
 
-async function verifyExtractedCitations(payload: {
-  text: string;
-  doc_id?: string;
-}): Promise<VerifyCitationsResponse> {
-  const response = await fetch(`${PUBLIC_API_BASE}/verify/citations/extracted`, {
+async function parseApiError(response: Response, fallback: string): Promise<string> {
+  const raw = await response.text().catch(() => "");
+  let detail = raw.trim();
+  try {
+    const parsed = JSON.parse(raw) as { detail?: string };
+    if (parsed.detail) {
+      detail = parsed.detail;
+    }
+  } catch {
+    // Keep response text if body is not JSON.
+  }
+  const suffix = detail ? ` - ${detail}` : "";
+  return `${response.status} ${response.statusText || fallback}${suffix}`;
+}
+
+async function fetchReportOverview(docId: string): Promise<ReportOverviewResponse> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/overview`, {
+    method: "GET"
+  });
+
+  if (!response.ok) {
+    throw new Error(await parseApiError(response, "Failed to load report overview"));
+  }
+
+  return (await response.json()) as ReportOverviewResponse;
+}
+
+async function fetchVerificationResultById(docId: string, resultId: number): Promise<VerifyCitationsResponse> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/verification/${resultId}`, {
+    method: "GET"
+  });
+
+  if (!response.ok) {
+    throw new Error(await parseApiError(response, "Failed to load verification run"));
+  }
+
+  return (await response.json()) as VerifyCitationsResponse;
+}
+
+async function createVerificationJob(docId: string, payload: { text?: string }): Promise<VerificationJobCreateResponse> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/verification/jobs`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json"
@@ -134,75 +247,22 @@ async function verifyExtractedCitations(payload: {
   });
 
   if (!response.ok) {
-    const raw = await response.text().catch(() => "");
-    let detail = raw.trim();
-    try {
-      const parsed = JSON.parse(raw) as { detail?: string };
-      if (parsed.detail) {
-        detail = parsed.detail;
-      }
-    } catch {
-      // Keep response text if body is not JSON.
-    }
-    const suffix = detail ? ` - ${detail}` : "";
-    throw new Error(`${response.status} ${response.statusText || "Verification failed"}${suffix}`);
+    throw new Error(await parseApiError(response, "Failed to create verification job"));
   }
 
-  return (await response.json()) as VerifyCitationsResponse;
+  return (await response.json()) as VerificationJobCreateResponse;
 }
 
-async function fetchStoredVerification(docId: string): Promise<VerifyCitationsResponse | null> {
-  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/verification`, {
+async function fetchVerificationJobStatus(docId: string, jobId: string): Promise<VerificationJobStatusResponse> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/verification/jobs/${jobId}`, {
     method: "GET"
   });
 
-  if (response.status === 404) {
-    return null;
-  }
-
   if (!response.ok) {
-    const raw = await response.text().catch(() => "");
-    let detail = raw.trim();
-    try {
-      const parsed = JSON.parse(raw) as { detail?: string };
-      if (parsed.detail) {
-        detail = parsed.detail;
-      }
-    } catch {
-      // Keep response text if body is not JSON.
-    }
-    const suffix = detail ? ` - ${detail}` : "";
-    throw new Error(`${response.status} ${response.statusText || "Failed to load verification"}${suffix}`);
+    throw new Error(await parseApiError(response, "Failed to fetch verification job status"));
   }
 
-  return (await response.json()) as VerifyCitationsResponse;
-}
-
-async function fetchBogusFindings(docId: string): Promise<BogusFinding[]> {
-  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/bogus`, {
-    method: "GET"
-  });
-
-  if (response.status === 404) {
-    return [];
-  }
-
-  if (!response.ok) {
-    const raw = await response.text().catch(() => "");
-    let detail = raw.trim();
-    try {
-      const parsed = JSON.parse(raw) as { detail?: string };
-      if (parsed.detail) {
-        detail = parsed.detail;
-      }
-    } catch {
-      // Keep response text if body is not JSON.
-    }
-    const suffix = detail ? ` - ${detail}` : "";
-    throw new Error(`${response.status} ${response.statusText || "Failed to load bogus findings"}${suffix}`);
-  }
-
-  return (await response.json()) as BogusFinding[];
+  return (await response.json()) as VerificationJobStatusResponse;
 }
 
 function normalizeCitationKey(value: string | null | undefined): string {
@@ -230,6 +290,23 @@ function findMatchingFinding(
     const probable = normalizeCitationKey(finding.probable_case_name);
     if (probable && probable === rawKey) {
       return finding;
+    }
+  }
+
+  return null;
+}
+
+function findMatchingRiskItem(citation: ReportCitation, risks: RiskItem[]): RiskItem | null {
+  const rawKey = normalizeCitationKey(citation.raw);
+  const contextKey = normalizeCitationKey(citation.context_text || "");
+
+  for (const risk of risks) {
+    const citationKey = normalizeCitationKey(risk.citation);
+    if (!citationKey) {
+      continue;
+    }
+    if (rawKey === citationKey || rawKey.includes(citationKey) || contextKey.includes(citationKey)) {
+      return risk;
     }
   }
 
@@ -386,10 +463,40 @@ function statusPill(status: string | null | undefined): string {
   if (value === "not_found") {
     return "inline-flex rounded-full border border-amber-400/40 bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-200";
   }
+  if (value === "ambiguous") {
+    return "inline-flex rounded-full border border-blue-400/40 bg-blue-500/15 px-2 py-0.5 text-xs font-medium text-blue-200";
+  }
+  if (value === "bogus") {
+    return "inline-flex rounded-full border border-orange-400/40 bg-orange-500/15 px-2 py-0.5 text-xs font-medium text-orange-200";
+  }
   if (value === "error") {
     return "inline-flex rounded-full border border-red-400/40 bg-red-500/15 px-2 py-0.5 text-xs font-medium text-red-200";
   }
   return "inline-flex rounded-full border border-slate-600 bg-slate-700/50 px-2 py-0.5 text-xs font-medium text-slate-200";
+}
+
+function statusSeverity(status: string, relatedBogus: boolean): number {
+  if (relatedBogus || status === "bogus") {
+    return 4;
+  }
+  if (status === "not_found") {
+    return 3;
+  }
+  if (status === "ambiguous") {
+    return 2;
+  }
+  if (status === "verified") {
+    return 1;
+  }
+  return 0;
+}
+
+function formatHistoryTimestamp(value: string): string {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toISOString().replace("T", " ").replace("Z", " UTC");
 }
 
 export default function ReportWorkspace({ docId, report }: { docId: string; report: ReportPayload }) {
@@ -400,19 +507,139 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const [selectedPage, setSelectedPage] = useState<number | null>(null);
   const [pdfError, setPdfError] = useState("");
   const [jumpMessage, setJumpMessage] = useState("");
+  const [overview, setOverview] = useState<ReportOverviewResponse | null>(null);
   const [verification, setVerification] = useState<VerifyCitationsResponse | null>(null);
   const [verificationBannerError, setVerificationBannerError] = useState("");
   const [bogusFindings, setBogusFindings] = useState<BogusFinding[]>([]);
+  const [activeHistoryId, setActiveHistoryId] = useState<number | null>(null);
+  const [jobStatusText, setJobStatusText] = useState("");
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [sortMode, setSortMode] = useState<SortMode>("risk_desc");
+
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
-  const citationRows = useMemo(
-    () =>
-      report.citations.map((citation, idx) => {
-        const finding = verification ? findMatchingFinding(citation, verification.findings) : null;
-        return { citation, idx, finding };
-      }),
-    [report.citations, verification],
-  );
+  const loadOverview = useCallback(async () => {
+    const data = await fetchReportOverview(docId);
+    setOverview(data);
+    setVerification(data.latest_verification);
+    setBogusFindings(data.bogus_findings);
+    setActiveHistoryId(null);
+  }, [docId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const run = async () => {
+      try {
+        const data = await fetchReportOverview(docId);
+        if (cancelled) {
+          return;
+        }
+        setOverview(data);
+        setVerification(data.latest_verification);
+        setBogusFindings(data.bogus_findings);
+        setActiveHistoryId(null);
+      } catch (err) {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : "Failed to load report overview";
+          setVerificationBannerError(message);
+        }
+      }
+    };
+
+    void run();
+    return () => {
+      cancelled = true;
+    };
+  }, [docId]);
+
+  const riskItems = useMemo(() => overview?.risk_report?.top_risks || [], [overview?.risk_report?.top_risks]);
+
+  const citationRows = useMemo(() => {
+    return report.citations.map((citation, idx): CitationRow => {
+      const finding = verification ? findMatchingFinding(citation, verification.findings) : null;
+      const riskItem = findMatchingRiskItem(citation, riskItems);
+      const relatedBogus = bogusFindings.some((item) => {
+        const findingKey = normalizeCitationKey(item.case_name);
+        const raw = normalizeCitationKey(citation.raw);
+        const context = normalizeCitationKey(citation.context_text || "");
+        return raw.includes(findingKey) || findingKey.includes(raw) || context.includes(findingKey);
+      });
+      const effectiveStatus = relatedBogus
+        ? "bogus"
+        : (finding?.status || citation.verification_status || "unverified");
+      return {
+        citation,
+        idx,
+        finding,
+        relatedBogus,
+        riskItem,
+        effectiveStatus
+      };
+    });
+  }, [bogusFindings, report.citations, riskItems, verification]);
+
+  const riskRankByCitation = useMemo(() => {
+    const map = new Map<string, number>();
+    riskItems.forEach((item, index) => {
+      map.set(normalizeCitationKey(item.citation), riskItems.length - index);
+    });
+    return map;
+  }, [riskItems]);
+
+  const filteredRows = useMemo(() => {
+    const query = normalizeWhitespace(searchQuery);
+    const rows = citationRows.filter((row) => {
+      if (statusFilter === "bogus" && !row.relatedBogus) {
+        return false;
+      }
+      if (statusFilter !== "all" && statusFilter !== "bogus" && row.effectiveStatus !== statusFilter) {
+        return false;
+      }
+      if (!query) {
+        return true;
+      }
+      const fields = [
+        row.citation.raw,
+        row.citation.context_text || "",
+        row.finding?.probable_case_name || "",
+        row.finding?.citation || ""
+      ];
+      return fields.some((value) => normalizeWhitespace(value).includes(query));
+    });
+
+    return rows.slice().sort((a, b) => {
+      if (sortMode === "citation_asc") {
+        const left = normalizeCitationKey(a.citation.raw);
+        const right = normalizeCitationKey(b.citation.raw);
+        const byCitation = left.localeCompare(right);
+        if (byCitation !== 0) {
+          return byCitation;
+        }
+        return a.idx - b.idx;
+      }
+
+      const leftKey = normalizeCitationKey(a.finding?.citation || a.citation.raw);
+      const rightKey = normalizeCitationKey(b.finding?.citation || b.citation.raw);
+      const leftRiskRank = riskRankByCitation.get(leftKey) || 0;
+      const rightRiskRank = riskRankByCitation.get(rightKey) || 0;
+      const leftSeverity = statusSeverity(a.effectiveStatus, a.relatedBogus);
+      const rightSeverity = statusSeverity(b.effectiveStatus, b.relatedBogus);
+      if (rightSeverity !== leftSeverity) {
+        return rightSeverity - leftSeverity;
+      }
+      if (rightRiskRank !== leftRiskRank) {
+        return rightRiskRank - leftRiskRank;
+      }
+      const byCitation = normalizeCitationKey(a.citation.raw).localeCompare(normalizeCitationKey(b.citation.raw));
+      if (byCitation !== 0) {
+        return byCitation;
+      }
+      return a.idx - b.idx;
+    });
+  }, [citationRows, riskRankByCitation, searchQuery, sortMode, statusFilter]);
+
   const counts = useMemo(() => {
     if (!verification) {
       return buildCounts(report.citations);
@@ -421,23 +648,30 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
       verified: verification.summary.verified,
       notFound: verification.summary.not_found,
       errors: 0,
-      unverified: Math.max(report.citations.length - verification.summary.total, 0),
+      unverified: Math.max(report.citations.length - verification.summary.total, 0)
     };
   }, [report.citations, verification]);
+
   const overallScore = useMemo(() => {
+    if (overview?.risk_report) {
+      return overview.risk_report.score;
+    }
     if (!verification) {
       return report.overall_score;
     }
     const total = Math.max(verification.summary.total, 1);
     return Math.round((100 * verification.summary.verified) / total);
-  }, [report.overall_score, verification]);
+  }, [overview?.risk_report, report.overall_score, verification]);
+
   const verificationReport = useMemo(() => (verification ? formatVerificationReport(verification) : null), [verification]);
+
   const selectedFinding = useMemo(() => {
     if (selectedCitationIndex === null) {
       return null;
     }
     return citationRows.find((row) => row.idx === selectedCitationIndex)?.finding || null;
   }, [citationRows, selectedCitationIndex]);
+
   const highlightTerms = useMemo(() => {
     const terms = report.citations.map((citation) => citation.raw);
     if (verification) {
@@ -445,59 +679,35 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     }
     return terms;
   }, [report.citations, verification]);
+
   const verificationText = useMemo(() => {
     const pieces = report.citations
       .map((citation) => [citation.raw, citation.context_text || ""].filter(Boolean).join("\n"))
       .filter((piece) => piece.trim().length > 0);
     return pieces.join("\n\n");
   }, [report.citations]);
+
+  const verificationHistory = useMemo(() => {
+    const rows = overview?.verification_history || [];
+    return rows.slice().sort((a, b) => {
+      const left = `${a.created_at}|${a.id}`;
+      const right = `${b.created_at}|${b.id}`;
+      return right.localeCompare(left);
+    });
+  }, [overview?.verification_history]);
+
+  const exportPdfUrl = useMemo(() => {
+    const raw = overview?.export_endpoints?.pdf_url || `/reports/${docId}/export.pdf`;
+    if (raw.startsWith("http://") || raw.startsWith("https://")) {
+      return raw;
+    }
+    if (raw.startsWith("/")) {
+      return `${PUBLIC_API_BASE}${raw}`;
+    }
+    return `${PUBLIC_API_BASE}/${raw}`;
+  }, [docId, overview?.export_endpoints?.pdf_url]);
+
   const pdfUrl = `${PUBLIC_API_BASE}/v1/documents/${docId}/pdf`;
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadStoredVerification = async () => {
-      try {
-        const stored = await fetchStoredVerification(docId);
-        if (!cancelled && stored) {
-          setVerification(stored);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : "Failed to load verification";
-          setVerificationBannerError(message);
-        }
-      }
-    };
-
-    void loadStoredVerification();
-    return () => {
-      cancelled = true;
-    };
-  }, [docId]);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    const loadBogus = async () => {
-      try {
-        const findings = await fetchBogusFindings(docId);
-        if (!cancelled) {
-          setBogusFindings(findings);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          const message = err instanceof Error ? err.message : "Failed to load bogus findings";
-          setVerificationBannerError(message);
-        }
-      }
-    };
-
-    void loadBogus();
-    return () => {
-      cancelled = true;
-    };
-  }, [docId]);
 
   const onDocumentLoadSuccess = async (pdf: any) => {
     setNumPages(pdf.numPages);
@@ -555,11 +765,44 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     }
 
     try {
-      const response = await verifyExtractedCitations({
-        text: verificationText,
-        doc_id: docId
+      const created = await createVerificationJob(docId, {
+        text: verificationText
       });
-      setVerification(response);
+      setJobStatusText(`Verification job ${created.job_id} queued...`);
+
+      let finalStatus: VerificationJobStatusResponse | null = null;
+      for (let attempt = 0; attempt < 180; attempt += 1) {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 1000);
+        });
+        const status = await fetchVerificationJobStatus(docId, created.job_id);
+        finalStatus = status;
+
+        if (status.status === "queued") {
+          setJobStatusText(`Verification job ${status.job_id} queued...`);
+          continue;
+        }
+        if (status.status === "running") {
+          setJobStatusText(`Verification job ${status.job_id} running...`);
+          continue;
+        }
+        if (status.status === "failed") {
+          const message = status.error_text || "Verification job failed";
+          setJobStatusText("");
+          throw new Error(message);
+        }
+        if (status.status === "done") {
+          break;
+        }
+      }
+
+      if (finalStatus === null || finalStatus.status !== "done") {
+        setJobStatusText("");
+        throw new Error("Verification job timed out before completion.");
+      }
+
+      await loadOverview();
+      setJobStatusText("Verification complete.");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Verification request failed";
       setVerificationBannerError(message);
@@ -573,11 +816,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     const row = citationRows.find(({ citation }) => {
       const raw = normalizeCitationKey(citation.raw);
       const context = normalizeCitationKey(citation.context_text || "");
-      return (
-        raw.includes(findingKey) ||
-        findingKey.includes(raw) ||
-        context.includes(findingKey)
-      );
+      return raw.includes(findingKey) || findingKey.includes(raw) || context.includes(findingKey);
     });
 
     if (row) {
@@ -585,6 +824,18 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
       return;
     }
     setJumpMessage("Related citation row not found for bogus finding.");
+  };
+
+  const onSelectHistory = async (resultId: number) => {
+    setVerificationBannerError("");
+    try {
+      const result = await fetchVerificationResultById(docId, resultId);
+      setVerification(result);
+      setActiveHistoryId(resultId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to load verification run";
+      setVerificationBannerError(message);
+    }
   };
 
   return (
@@ -625,7 +876,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
             Export Markdown
           </button>
           <a
-            href={`${PUBLIC_API_BASE}/reports/${docId}/export.pdf`}
+            href={exportPdfUrl}
             target="_blank"
             rel="noopener"
             className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-700"
@@ -633,11 +884,19 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
             Export PDF
           </a>
         </div>
+
+        {jobStatusText ? (
+          <p className="mb-3 rounded-md border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-sm text-blue-200">
+            {jobStatusText}
+          </p>
+        ) : null}
+
         {verificationBannerError ? (
           <p className="mb-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
             {verificationBannerError}
           </p>
         ) : null}
+
         <div className="grid gap-3 text-sm text-slate-200 md:grid-cols-3">
           <p className="rounded-lg border border-slate-700 bg-slate-800/70 p-3">
             <strong className="block text-xs uppercase tracking-wide text-slate-400">Summary</strong>
@@ -655,6 +914,66 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
           </p>
         </div>
       </div>
+
+      {overview?.risk_report ? (
+        <section className="rounded-2xl border border-slate-700/70 bg-slate-900/60 p-4 text-sm text-slate-200">
+          <h3 className="text-sm font-semibold text-slate-100">Risk breakdown</h3>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <div className="rounded-lg border border-slate-700 bg-slate-800/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-400">Score</p>
+              <p className="mt-1 text-2xl font-semibold text-blue-200">{overview.risk_report.score}</p>
+              <p className="mt-2 text-xs text-slate-400">
+                verified {overview.risk_report.totals.verified} / ambiguous {overview.risk_report.totals.ambiguous} / not_found {overview.risk_report.totals.not_found} / bogus {overview.risk_report.totals.bogus}
+              </p>
+            </div>
+            <div className="rounded-lg border border-slate-700 bg-slate-800/70 p-3">
+              <p className="text-xs uppercase tracking-wide text-slate-400">Top risks (5)</p>
+              <ul className="mt-2 space-y-1 text-xs text-slate-300">
+                {overview.risk_report.top_risks.slice(0, 5).map((item, idx) => (
+                  <li key={`${item.citation}-${idx}`}>
+                    {item.citation} [{item.status}]
+                    {item.bogus_reason ? ` (${item.bogus_reason})` : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
+      <section className="rounded-2xl border border-slate-700/70 bg-slate-900/60 p-4 text-sm text-slate-200">
+        <h3 className="text-sm font-semibold text-slate-100">History</h3>
+        {verificationHistory.length === 0 ? (
+          <p className="mt-2 text-xs text-slate-400">No verification history yet.</p>
+        ) : (
+          <ul className="mt-3 space-y-2">
+            {verificationHistory.map((item) => {
+              const total = Math.max(item.summary.total, 1);
+              const score = Math.round((100 * item.summary.verified) / total);
+              const active = activeHistoryId === item.id;
+              return (
+                <li key={item.id}>
+                  <button
+                    type="button"
+                    onClick={() => void onSelectHistory(item.id)}
+                    className={`w-full rounded-lg border px-3 py-2 text-left ${
+                      active
+                        ? "border-blue-500 bg-blue-500/10"
+                        : "border-slate-700 bg-slate-800/60 hover:bg-slate-700/70"
+                    }`}
+                  >
+                    <p className="text-sm text-slate-100">Run #{item.id}</p>
+                    <p className="text-xs text-slate-400">{formatHistoryTimestamp(item.created_at)}</p>
+                    <p className="mt-1 text-xs text-slate-300">
+                      score {score} / total {item.summary.total} / verified {item.summary.verified} / not_found {item.summary.not_found} / ambiguous {item.summary.ambiguous}
+                    </p>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
 
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
         <div className="max-h-[75vh] overflow-auto rounded-2xl border border-slate-700/70 bg-slate-900/70 p-2">
@@ -699,14 +1018,44 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
             </button>
           </div>
 
+          <div className="mb-3 grid gap-2">
+            <div className="grid gap-2 sm:grid-cols-2">
+              <select
+                value={statusFilter}
+                onChange={(event) => setStatusFilter(event.target.value as StatusFilter)}
+                className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200"
+              >
+                <option value="all">All statuses</option>
+                <option value="verified">Verified</option>
+                <option value="not_found">Not found</option>
+                <option value="ambiguous">Ambiguous</option>
+                <option value="bogus">Bogus</option>
+              </select>
+              <select
+                value={sortMode}
+                onChange={(event) => setSortMode(event.target.value as SortMode)}
+                className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200"
+              >
+                <option value="risk_desc">Sort: risk desc</option>
+                <option value="citation_asc">Sort: citation asc</option>
+              </select>
+            </div>
+            <input
+              value={searchQuery}
+              onChange={(event) => setSearchQuery(event.target.value)}
+              placeholder="Search citation or probable case name"
+              className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200 placeholder:text-slate-500"
+            />
+          </div>
+
           {jumpMessage ? (
             <p className="mb-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
               {jumpMessage}
             </p>
           ) : null}
 
-          {report.citations.length === 0 ? (
-            <p className="text-sm text-slate-400">No citations found for this document.</p>
+          {filteredRows.length === 0 ? (
+            <p className="text-sm text-slate-400">No citations matched your filters.</p>
           ) : (
             <table className="w-full border-collapse text-sm text-slate-200">
               <thead>
@@ -726,48 +1075,38 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                 </tr>
               </thead>
               <tbody>
-                {citationRows.map(({ citation, idx, finding }) => {
-                  const status = finding?.status || citation.verification_status || "unverified";
-                  const link = finding?.best_match?.url || citation.verification_details?.courtlistener_url || null;
-                  const relatedBogus = bogusFindings.some((item) => {
-                    const findingKey = normalizeCitationKey(item.case_name);
-                    const raw = normalizeCitationKey(citation.raw);
-                    const context = normalizeCitationKey(citation.context_text || "");
-                    return (
-                      raw.includes(findingKey) ||
-                      findingKey.includes(raw) ||
-                      context.includes(findingKey)
-                    );
-                  });
+                {filteredRows.map((row) => {
+                  const { citation, idx, finding, effectiveStatus, relatedBogus } = row;
+                  const link = finding?.best_match?.url || citation.verification_details?.courtlistener_url || row.riskItem?.link || null;
                   return (
-                  <tr
-                    key={`${citation.raw}-${citation.start ?? "na"}-${idx}`}
-                    onClick={() => jumpToCitation(citation, idx)}
-                    className={`cursor-pointer transition ${
-                      selectedCitationIndex === idx
-                        ? "bg-blue-500/10"
-                        : relatedBogus
-                          ? "bg-amber-500/5 hover:bg-amber-500/10"
-                          : "hover:bg-slate-800/70"
-                    }`}
-                  >
-                    <td className="border-b border-slate-800 px-2 py-2 align-top">{citation.raw}</td>
-                    <td className="border-b border-slate-800 px-2 py-2 align-top">
-                      {truncateContext(citation.context_text) || "-"}
-                    </td>
-                    <td className="border-b border-slate-800 px-2 py-2 align-top">
-                      <span className={statusPill(status)}>{status}</span>
-                    </td>
-                    <td className="border-b border-slate-800 px-2 py-2 align-top">
-                      {link ? (
-                        <a href={link} target="_blank" rel="noopener" className="text-blue-300 hover:text-blue-200">
-                          Open
-                        </a>
-                      ) : (
-                        "-"
-                      )}
-                    </td>
-                  </tr>
+                    <tr
+                      key={`${citation.raw}-${citation.start ?? "na"}-${idx}`}
+                      onClick={() => jumpToCitation(citation, idx)}
+                      className={`cursor-pointer transition ${
+                        selectedCitationIndex === idx
+                          ? "bg-blue-500/10"
+                          : relatedBogus
+                            ? "bg-amber-500/5 hover:bg-amber-500/10"
+                            : "hover:bg-slate-800/70"
+                      }`}
+                    >
+                      <td className="border-b border-slate-800 px-2 py-2 align-top">{citation.raw}</td>
+                      <td className="border-b border-slate-800 px-2 py-2 align-top">
+                        {truncateContext(citation.context_text) || "-"}
+                      </td>
+                      <td className="border-b border-slate-800 px-2 py-2 align-top">
+                        <span className={statusPill(effectiveStatus)}>{effectiveStatus}</span>
+                      </td>
+                      <td className="border-b border-slate-800 px-2 py-2 align-top">
+                        {link ? (
+                          <a href={link} target="_blank" rel="noopener" className="text-blue-300 hover:text-blue-200">
+                            Open
+                          </a>
+                        ) : (
+                          "-"
+                        )}
+                      </td>
+                    </tr>
                   );
                 })}
               </tbody>
