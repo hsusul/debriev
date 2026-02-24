@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from io import BytesIO
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
+import types
 from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError
 from uuid import UUID, uuid4
@@ -22,6 +25,7 @@ from app.db import (
     VerificationResult,
 )
 from app.main import (
+    ChatFinding,
     VerificationJobCreateRequest,
     VerifyCitationsRequest,
     VerifyExtractedCitationsRequest,
@@ -31,10 +35,14 @@ from app.main import (
     _extract_citation_evidence,
     _extract_citation_evidence_from_chunks,
     _extract_citations_from_chunks,
+    _reap_stale_verification_jobs,
     _run_citation_verification_for_citations,
     _courtlistener_raw_to_findings,
     _execute_verification_job,
     create_verification_job,
+    export_report_pdf,
+    get_report_citations,
+    get_report_risk,
     get_report_verification_history,
     get_verification_job_status,
     get_report_verification,
@@ -115,7 +123,9 @@ def test_lookup_citations_missing_token_raises() -> None:
             except CourtListenerError as exc:
                 assert "COURTLISTENER_TOKEN" in str(exc)
             else:
-                raise AssertionError("Expected CourtListenerError when token is missing")
+                raise AssertionError(
+                    "Expected CourtListenerError when token is missing"
+                )
 
 
 def test_lookup_citations_sends_token_header() -> None:
@@ -413,6 +423,10 @@ def test_courtlistener_raw_to_findings_ambiguous_is_deterministic() -> None:
     assert first[0].confidence == 0.5
     assert first[0].best_match is not None
     assert first[0].best_match.case_name == "Alpha v. Bravo"
+    assert [candidate.case_name for candidate in first[0].candidates] == [
+        "Alpha v. Bravo",
+        "Zulu v. Echo",
+    ]
 
 
 def test_extract_citations_dedupes_and_orders_deterministically() -> None:
@@ -798,3 +812,231 @@ def test_extract_case_name_by_citation_map_is_stable() -> None:
         "347 U.S. 483": "Brown v. Board",
         "410 U.S. 113": "Roe v. Wade",
     }
+
+
+def test_get_report_citations_returns_persisted_extraction(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973). Brown v. Board, 347 U.S. 483 (1954).",
+        doc_id=doc_id,
+    )
+    mock_lookup = Mock(
+        return_value={
+            "results": [
+                {"citation": "347 U.S. 483", "results": [{"citation": "347 U.S. 483"}]},
+                {"citation": "410 U.S. 113", "results": [{"citation": "410 U.S. 113"}]},
+            ]
+        }
+    )
+
+    with _make_session(tmp_path) as session:
+        with patch("app.main.CourtListenerClient.lookup_citation_list", mock_lookup):
+            verify_citations_extracted(payload, session=session)
+        stored = get_report_citations(doc_id=UUID(doc_id), session=session).model_dump()
+
+    assert stored["citations"] == ["347 U.S. 483", "410 U.S. 113"]
+    assert list(stored["evidence"]) == ["347 U.S. 483", "410 U.S. 113"]
+    assert stored["probable_case_name"] == {
+        "347 U.S. 483": "Brown v. Board",
+        "410 U.S. 113": "Roe v. Wade",
+    }
+
+
+def test_get_report_risk_is_deterministic_with_bogus_overlay(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973). Brown v. Board, 347 U.S. 483 (1954).",
+        doc_id=doc_id,
+    )
+    mock_lookup = Mock(
+        return_value={
+            "results": [
+                {"citation": "347 U.S. 483", "results": []},
+                {"citation": "410 U.S. 113", "results": []},
+            ]
+        }
+    )
+    bogus_findings = [
+        ChatFinding(
+            case_name="Roe v. Wade",
+            reason_label="nonexistent_case",
+            reason_phrase="does not appear to exist",
+            evidence="Roe v. Wade, 410 U.S. 113 does not appear to exist.",
+            doc_id=doc_id,
+            chunk_id="chunk-1",
+        )
+    ]
+
+    with _make_session(tmp_path) as session:
+        with patch("app.main.CourtListenerClient.lookup_citation_list", mock_lookup):
+            verify_citations_extracted(payload, session=session)
+        with patch("app.main._get_bogus_findings_for_doc", return_value=bogus_findings):
+            first = get_report_risk(doc_id=UUID(doc_id), session=session).model_dump()
+            second = get_report_risk(doc_id=UUID(doc_id), session=session).model_dump()
+
+    assert first == second
+    assert first["score"] == 85
+    assert first["totals"] == {
+        "verified": 0,
+        "not_found": 2,
+        "ambiguous": 0,
+        "bogus": 1,
+    }
+    assert [item["citation"] for item in first["top_risks"]] == [
+        "347 U.S. 483",
+        "410 U.S. 113",
+    ]
+
+
+def test_reap_stale_verification_jobs_marks_old_jobs_failed(tmp_path: Path) -> None:
+    with _make_session(tmp_path) as session:
+        stale = VerificationJob(
+            id="job-stale",
+            doc_id=str(uuid4()),
+            status="queued",
+            created_at=datetime.now(UTC) - timedelta(hours=1),
+            updated_at=datetime.now(UTC) - timedelta(hours=1),
+        )
+        fresh = VerificationJob(
+            id="job-fresh",
+            doc_id=str(uuid4()),
+            status="running",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add(stale)
+        session.add(fresh)
+        session.commit()
+
+        updated = _reap_stale_verification_jobs(session, stale_minutes=15)
+        stale_after = session.exec(
+            select(VerificationJob).where(VerificationJob.id == stale.id)
+        ).first()
+        fresh_after = session.exec(
+            select(VerificationJob).where(VerificationJob.id == fresh.id)
+        ).first()
+
+    assert updated == 1
+    assert stale_after is not None
+    assert stale_after.status == "failed"
+    assert stale_after.error_text is not None
+    assert fresh_after is not None
+    assert fresh_after.status == "running"
+
+
+def test_execute_verification_job_is_idempotent_when_result_present(
+    tmp_path: Path,
+) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = str(uuid4())
+        job = VerificationJob(
+            id="job-idempotent",
+            doc_id=doc_id,
+            status="running",
+            result_id=123,
+        )
+        session.add(job)
+        session.commit()
+
+        with patch(
+            "app.main._run_extracted_verification",
+            side_effect=AssertionError("should not rerun completed job"),
+        ):
+            _execute_verification_job(job_id=job.id, text=None, session=session)
+
+        stored = session.exec(
+            select(VerificationJob).where(VerificationJob.id == job.id)
+        ).first()
+
+    assert stored is not None
+    assert stored.status == "done"
+    assert stored.result_id == 123
+
+
+def test_export_report_pdf_returns_pdf_and_is_deterministic(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    class _FakeCanvas:
+        def __init__(
+            self, buffer: BytesIO, pagesize: tuple[float, float], invariant: int = 1
+        ) -> None:
+            self._buffer = buffer
+            self._lines: list[str] = []
+            self._pagesize = pagesize
+            self._invariant = invariant
+
+        def setFont(self, name: str, size: int) -> None:
+            self._lines.append(f"FONT:{name}:{size}")
+
+        def drawString(self, x: float, y: float, text: str) -> None:
+            self._lines.append(f"TEXT:{x:.1f}:{y:.1f}:{text}")
+
+        def showPage(self) -> None:
+            self._lines.append("PAGE")
+
+        def save(self) -> None:
+            payload = "\n".join(
+                ["%PDF-1.4", f"SIZE:{self._pagesize}", f"INV:{self._invariant}"]
+                + self._lines
+            )
+            self._buffer.write(payload.encode("utf-8"))
+
+    fake_reportlab = types.ModuleType("reportlab")
+    fake_reportlab_lib = types.ModuleType("reportlab.lib")
+    fake_pagesizes = types.ModuleType("reportlab.lib.pagesizes")
+    fake_pagesizes.LETTER = (612.0, 792.0)
+    fake_pdfgen = types.ModuleType("reportlab.pdfgen")
+    fake_canvas = types.ModuleType("reportlab.pdfgen.canvas")
+    fake_canvas.Canvas = _FakeCanvas
+
+    monkeypatch.setitem(sys.modules, "reportlab", fake_reportlab)
+    monkeypatch.setitem(sys.modules, "reportlab.lib", fake_reportlab_lib)
+    monkeypatch.setitem(sys.modules, "reportlab.lib.pagesizes", fake_pagesizes)
+    monkeypatch.setitem(sys.modules, "reportlab.pdfgen", fake_pdfgen)
+    monkeypatch.setitem(sys.modules, "reportlab.pdfgen.canvas", fake_canvas)
+
+    with _make_session(tmp_path) as session:
+        doc_id = uuid4()
+        session.add(
+            Document(
+                doc_id=doc_id,
+                filename="fixture.pdf",
+                file_path="/tmp/fixture.pdf",
+                stub_text="stub",
+            )
+        )
+        session.add(
+            VerificationResult(
+                doc_id=str(doc_id),
+                input_hash="input",
+                citations_hash="citations",
+                citations_json=json.dumps(["410 U.S. 113"]),
+                findings_json=json.dumps(
+                    [
+                        {
+                            "citation": "410 U.S. 113",
+                            "status": "not_found",
+                            "confidence": 0.0,
+                            "best_match": None,
+                            "candidates": [],
+                            "explanation": "No CourtListener matches were returned for this citation.",
+                            "evidence": "Roe v. Wade, 410 U.S. 113",
+                            "probable_case_name": "Roe v. Wade",
+                        }
+                    ]
+                ),
+                summary_json=json.dumps(
+                    {"total": 1, "verified": 0, "not_found": 1, "ambiguous": 0}
+                ),
+            )
+        )
+        session.commit()
+
+        with patch("app.main._get_bogus_findings_for_doc", return_value=[]):
+            first = export_report_pdf(doc_id=doc_id, session=session)
+            second = export_report_pdf(doc_id=doc_id, session=session)
+
+    assert first.media_type == "application/pdf"
+    assert second.media_type == "application/pdf"
+    assert first.body == second.body
+    assert first.body.startswith(b"%PDF-1.4")

@@ -41,6 +41,7 @@ type CitationVerificationFinding = {
   status: "verified" | "not_found" | "ambiguous";
   confidence: number;
   best_match: BestMatch | null;
+  candidates: BestMatch[];
   explanation: string;
   evidence: string;
   probable_case_name: string | null;
@@ -623,6 +624,14 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
           >
             Export Markdown
           </button>
+          <a
+            href={`${PUBLIC_API_BASE}/reports/${docId}/export.pdf`}
+            target="_blank"
+            rel="noopener"
+            className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm font-medium text-slate-200 transition hover:bg-slate-700"
+          >
+            Export PDF
+          </a>
         </div>
         {verificationBannerError ? (
           <p className="mb-3 rounded-md border border-red-500/40 bg-red-500/10 px-3 py-2 text-sm text-red-200">
@@ -791,6 +800,34 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                     {selectedFinding?.best_match?.year ? ` ${selectedFinding.best_match.year}` : ""}
                   </span>
                 </p>
+                {selectedFinding?.status === "ambiguous" && selectedFinding.candidates.length > 0 ? (
+                  <details className="rounded-md border border-slate-700 bg-slate-900/60 p-2">
+                    <summary className="cursor-pointer text-slate-300">
+                      View candidates ({selectedFinding.candidates.length})
+                    </summary>
+                    <ul className="mt-2 space-y-2">
+                      {selectedFinding.candidates.map((candidate, idx) => (
+                        <li key={`${candidate.case_name || "candidate"}-${idx}`} className="rounded border border-slate-700 px-2 py-1">
+                          <p className="text-slate-100">
+                            {candidate.case_name || "-"}
+                            {candidate.year ? ` (${candidate.year})` : ""}
+                          </p>
+                          <p className="text-slate-400">{candidate.court || "-"}</p>
+                          {candidate.url ? (
+                            <a
+                              href={candidate.url}
+                              target="_blank"
+                              rel="noopener"
+                              className="text-blue-300 hover:text-blue-200"
+                            >
+                              {candidate.url}
+                            </a>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                ) : null}
               </div>
             </div>
           ) : null}

@@ -85,6 +85,16 @@ class VerificationResult(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
 
+class ExtractedCitations(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    doc_id: str = Field(index=True, unique=True)
+    citations_json: str = Field(sa_column=Column(Text, nullable=False))
+    evidence_json: str = Field(sa_column=Column(Text, nullable=False))
+    probable_case_name_json: str = Field(sa_column=Column(Text, nullable=False))
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
 class VerificationJob(SQLModel, table=True):
     id: str = Field(default_factory=lambda: str(uuid4()), primary_key=True, index=True)
     doc_id: str = Field(index=True)

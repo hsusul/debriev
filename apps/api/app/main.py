@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -21,7 +22,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 try:
@@ -47,10 +48,12 @@ from app.db import (
     Report,
     VerificationJob,
     VerificationResult,
+    get_latest_extracted_citations,
     get_latest_verification_result,
     get_session,
     init_db,
     list_verification_results,
+    store_extracted_citations,
     store_verification_result,
 )
 from app.retrieval.service import (
@@ -63,11 +66,40 @@ from app.db.session import engine
 from app.settings import settings
 
 
+def _reap_stale_verification_jobs(session: Session, *, stale_minutes: int = 15) -> int:
+    cutoff = datetime.now(UTC) - timedelta(minutes=max(1, stale_minutes))
+    cutoff_naive = cutoff.replace(tzinfo=None)
+    jobs = session.exec(
+        select(VerificationJob).where(VerificationJob.status.in_(["queued", "running"]))
+    ).all()
+    updated = 0
+    for job in jobs:
+        job_updated_at = job.updated_at
+        if job_updated_at.tzinfo is None:
+            is_fresh = job_updated_at >= cutoff_naive
+        else:
+            is_fresh = job_updated_at >= cutoff
+        if is_fresh:
+            continue
+        job.status = "failed"
+        job.error_text = (
+            f"Marked failed by startup reaper after {max(1, stale_minutes)} minutes"
+        )
+        job.updated_at = datetime.now(UTC)
+        session.add(job)
+        updated += 1
+    if updated:
+        session.commit()
+    return updated
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Path(settings.storage_dir).mkdir(parents=True, exist_ok=True)
     init_db()
     init_retrieval_db(settings.retrieval_db_path)
+    with Session(engine) as startup_session:
+        _reap_stale_verification_jobs(startup_session)
     token_present = bool(
         (settings.courtlistener_token or "").strip()
         or os.getenv("COURTLISTENER_TOKEN", "").strip()
@@ -215,6 +247,7 @@ class CitationVerificationFinding(BaseModel):
     status: str
     confidence: float
     best_match: BestMatch | None = None
+    candidates: list[BestMatch] = Field(default_factory=list)
     explanation: str
     evidence: str = ""
     probable_case_name: str | None = None
@@ -251,6 +284,39 @@ class VerifyExtractedCitationsRequest(BaseModel):
     doc_id: str | None = None
     chunk_id: str | None = None
     include_raw: bool = False
+
+
+class ExtractedCitationsResponse(BaseModel):
+    citations: list[str] = Field(default_factory=list)
+    evidence: dict[str, str] = Field(default_factory=dict)
+    probable_case_name: dict[str, str | None] = Field(default_factory=dict)
+
+
+class RiskTotals(BaseModel):
+    verified: int = 0
+    not_found: int = 0
+    ambiguous: int = 0
+    bogus: int = 0
+
+
+class RiskItem(BaseModel):
+    citation: str
+    status: str
+    bogus_reason: str | None = None
+    evidence: str
+    probable_case_name: str | None = None
+    link: str | None = None
+
+
+class RiskReport(BaseModel):
+    score: int
+    totals: RiskTotals
+    top_risks: list[RiskItem] = Field(default_factory=list)
+
+
+class VerificationWithRiskResponse(BaseModel):
+    verification: VerifyCitationsResponse
+    risk: RiskReport
 
 
 class VerificationHistoryItem(BaseModel):
@@ -956,6 +1022,112 @@ def _persist_verification_response(
     )
 
 
+def _normalize_extracted_payload(
+    *,
+    citations: list[str],
+    evidence_map: dict[str, str],
+    probable_case_name_map: dict[str, str | None],
+) -> tuple[list[str], dict[str, str], dict[str, str | None]]:
+    normalized_citations = _normalize_citation_list(citations)
+    normalized_evidence: dict[str, str] = {}
+    normalized_case_names: dict[str, str | None] = {}
+
+    evidence_by_key = {
+        _normalize_citation_string(key): _normalize_ws(value) if value else ""
+        for key, value in evidence_map.items()
+        if _normalize_citation_string(key)
+    }
+    case_name_by_key = {
+        _normalize_citation_string(key): (_normalize_ws(value) if value else None)
+        for key, value in probable_case_name_map.items()
+        if _normalize_citation_string(key)
+    }
+
+    for citation in normalized_citations:
+        key = _normalize_citation_string(citation)
+        normalized_evidence[citation] = evidence_by_key.get(key, "")
+        normalized_case_names[citation] = case_name_by_key.get(key)
+
+    return normalized_citations, normalized_evidence, normalized_case_names
+
+
+def _store_extracted_citations_for_doc(
+    *,
+    session: Session,
+    doc_id: str,
+    citations: list[str],
+    evidence_map: dict[str, str],
+    probable_case_name_map: dict[str, str | None],
+) -> ExtractedCitationsResponse:
+    normalized_citations, normalized_evidence, normalized_case_names = (
+        _normalize_extracted_payload(
+            citations=citations,
+            evidence_map=evidence_map,
+            probable_case_name_map=probable_case_name_map,
+        )
+    )
+    store_extracted_citations(
+        session,
+        doc_id=doc_id,
+        citations=normalized_citations,
+        evidence_map=normalized_evidence,
+        probable_case_name_map=normalized_case_names,
+    )
+    return ExtractedCitationsResponse(
+        citations=normalized_citations,
+        evidence=normalized_evidence,
+        probable_case_name=normalized_case_names,
+    )
+
+
+def _get_persisted_extracted_citations(
+    *, session: Session, doc_id: str
+) -> ExtractedCitationsResponse | None:
+    stored = get_latest_extracted_citations(session, doc_id=doc_id)
+    if stored is None:
+        return None
+
+    try:
+        citations_raw = json.loads(stored.citations_json)
+        evidence_raw = json.loads(stored.evidence_json)
+        probable_raw = json.loads(stored.probable_case_name_json)
+    except json.JSONDecodeError:
+        return None
+
+    citations = (
+        [str(item) for item in citations_raw] if isinstance(citations_raw, list) else []
+    )
+    evidence_map = (
+        {
+            str(key): _normalize_ws(str(value) if value is not None else "")
+            for key, value in evidence_raw.items()
+        }
+        if isinstance(evidence_raw, dict)
+        else {}
+    )
+    probable_map = (
+        {
+            str(key): (_normalize_ws(str(value)) if value is not None else None)
+            for key, value in probable_raw.items()
+        }
+        if isinstance(probable_raw, dict)
+        else {}
+    )
+
+    normalized_citations, normalized_evidence, normalized_case_names = (
+        _normalize_extracted_payload(
+            citations=citations,
+            evidence_map=evidence_map,
+            probable_case_name_map=probable_map,
+        )
+    )
+    return ExtractedCitationsResponse(
+        citations=normalized_citations,
+        evidence=normalized_evidence,
+        probable_case_name=normalized_case_names,
+    )
+
+
 def _run_extracted_verification(
     *,
     session: Session,
@@ -967,6 +1139,37 @@ def _run_extracted_verification(
     citations = _extract_citations(text)
     evidence_by_citation = _extract_citation_evidence(text, citations)
     probable_case_name_by_citation = _extract_case_name_by_citation(text, citations)
+
+    extraction_payload = _normalize_extracted_payload(
+        citations=citations,
+        evidence_map=evidence_by_citation,
+        probable_case_name_map=probable_case_name_by_citation,
+    )
+    normalized_doc_id = doc_id.strip() if doc_id and doc_id.strip() else None
+    if normalized_doc_id:
+        _store_extracted_citations_for_doc(
+            session=session,
+            doc_id=normalized_doc_id,
+            citations=extraction_payload[0],
+            evidence_map=extraction_payload[1],
+            probable_case_name_map=extraction_payload[2],
+        )
+        persisted = _get_persisted_extracted_citations(
+            session=session, doc_id=normalized_doc_id
+        )
+        if persisted is not None:
+            citations = persisted.citations
+            evidence_by_citation = persisted.evidence
+            probable_case_name_by_citation = persisted.probable_case_name
+        else:
+            citations, evidence_by_citation, probable_case_name_by_citation = (
+                extraction_payload
+            )
+    else:
+        citations, evidence_by_citation, probable_case_name_by_citation = (
+            extraction_payload
+        )
+
     response = _run_citation_verification_for_citations(
         citations=citations,
         session=session,
@@ -976,10 +1179,10 @@ def _run_extracted_verification(
         evidence_by_citation=evidence_by_citation,
         probable_case_name_by_citation=probable_case_name_by_citation,
     )
-    if doc_id and doc_id.strip():
+    if normalized_doc_id:
         _persist_verification_response(
             session=session,
-            doc_id=doc_id,
+            doc_id=normalized_doc_id,
             source_text=text,
             response=response,
         )
@@ -1019,6 +1222,13 @@ def _execute_verification_job(job_id: str, text: str | None, session: Session) -
         select(VerificationJob).where(VerificationJob.id == job_id)
     ).first()
     if job is None:
+        return
+    if job.result_id is not None:
+        if job.status != "done":
+            job.status = "done"
+            job.updated_at = datetime.now(UTC)
+            session.add(job)
+            session.commit()
         return
 
     job.status = "running"
@@ -1088,14 +1298,19 @@ def verify_citations_extracted(
     )
 
 
-@app.get("/reports/{doc_id}/verification", response_model=VerifyCitationsResponse)
-def get_report_verification(
+@app.get("/reports/{doc_id}/citations", response_model=ExtractedCitationsResponse)
+def get_report_citations(
     doc_id: UUID, session: Session = Depends(get_session)
-) -> VerifyCitationsResponse:
-    stored = get_latest_verification_result(session, doc_id=str(doc_id))
+) -> ExtractedCitationsResponse:
+    stored = _get_persisted_extracted_citations(session=session, doc_id=str(doc_id))
     if stored is None:
-        raise HTTPException(status_code=404, detail="Verification result not found")
+        raise HTTPException(status_code=404, detail="Extracted citations not found")
+    return stored
 
+
+def _verification_response_from_result(
+    stored: VerificationResult,
+) -> VerifyCitationsResponse:
     try:
         citations_raw = json.loads(stored.citations_json)
         findings_raw = json.loads(stored.findings_json)
@@ -1114,7 +1329,6 @@ def get_report_verification(
         for item in findings_raw:
             if isinstance(item, dict):
                 findings.append(CitationVerificationFinding.model_validate(item))
-
     findings.sort(key=lambda item: _normalize_citation_string(item.citation))
     summary = CitationVerificationSummary.model_validate(
         summary_raw if isinstance(summary_raw, dict) else {}
@@ -1125,6 +1339,16 @@ def get_report_verification(
         citations=citations,
         raw=None,
     )
+
+
+@app.get("/reports/{doc_id}/verification", response_model=VerifyCitationsResponse)
+def get_report_verification(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> VerifyCitationsResponse:
+    stored = get_latest_verification_result(session, doc_id=str(doc_id))
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Verification result not found")
+    return _verification_response_from_result(stored)
 
 
 @app.get(
@@ -1156,6 +1380,226 @@ def get_report_verification_history(
         )
     history.sort(key=lambda item: (item.created_at, item.id), reverse=True)
     return history
+
+
+def _get_bogus_findings_for_doc(session: Session, doc_id: UUID) -> list[ChatFinding]:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    source_text = document.stub_text or ""
+    if not _normalize_ws(source_text):
+        return []
+
+    findings = _extract_bogus_case_findings(
+        [{"doc_id": str(doc_id), "chunk_id": f"{doc_id}:stub", "text": source_text}]
+    )
+    return _to_chat_findings(findings)
+
+
+def _build_risk_report(
+    verification: VerifyCitationsResponse,
+    bogus_findings: list[ChatFinding],
+) -> RiskReport:
+    status_weights = {"verified": 0, "ambiguous": 10, "not_found": 25}
+    risk_items: list[tuple[int, RiskItem]] = []
+    bogus_by_key = {_case_key(item.case_name): item for item in bogus_findings}
+
+    bogus_matches: set[str] = set()
+    for finding in verification.findings:
+        citation_key = _case_key(finding.citation)
+        probable_key = _case_key(finding.probable_case_name or "")
+        evidence_key = _case_key(finding.evidence)
+        matched_bogus: ChatFinding | None = None
+        for bogus_key, bogus in bogus_by_key.items():
+            if not bogus_key:
+                continue
+            if (
+                bogus_key in citation_key
+                or bogus_key in probable_key
+                or bogus_key in evidence_key
+                or citation_key in bogus_key
+                or probable_key in bogus_key
+            ):
+                matched_bogus = bogus
+                bogus_matches.add(bogus_key)
+                break
+
+        status_weight = status_weights.get(finding.status, 0)
+        bogus_weight = 35 if matched_bogus is not None else 0
+        risk_score = min(100, status_weight + bogus_weight)
+        evidence = matched_bogus.evidence if matched_bogus else finding.evidence
+        risk_items.append(
+            (
+                risk_score,
+                RiskItem(
+                    citation=finding.citation,
+                    status=finding.status,
+                    bogus_reason=(
+                        matched_bogus.reason_label
+                        if matched_bogus is not None
+                        else None
+                    ),
+                    evidence=evidence,
+                    probable_case_name=finding.probable_case_name,
+                    link=finding.best_match.url if finding.best_match else None,
+                ),
+            )
+        )
+
+    for bogus in bogus_findings:
+        bogus_key = _case_key(bogus.case_name)
+        if bogus_key in bogus_matches:
+            continue
+        risk_items.append(
+            (
+                35,
+                RiskItem(
+                    citation=bogus.case_name,
+                    status="bogus",
+                    bogus_reason=bogus.reason_label,
+                    evidence=bogus.evidence,
+                    probable_case_name=bogus.case_name,
+                    link=None,
+                ),
+            )
+        )
+
+    risk_items.sort(
+        key=lambda item: (
+            -item[0],
+            _normalize_citation_string(item[1].citation),
+            _normalize_ws(item[1].status),
+        )
+    )
+    top_risks = [item for _, item in risk_items]
+
+    totals = RiskTotals(
+        verified=verification.summary.verified,
+        not_found=verification.summary.not_found,
+        ambiguous=verification.summary.ambiguous,
+        bogus=len(bogus_findings),
+    )
+    score = min(
+        100,
+        totals.ambiguous * 10 + totals.not_found * 25 + totals.bogus * 35,
+    )
+    return RiskReport(score=score, totals=totals, top_risks=top_risks)
+
+
+@app.get("/reports/{doc_id}/risk", response_model=RiskReport)
+def get_report_risk(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> RiskReport:
+    stored = get_latest_verification_result(session, doc_id=str(doc_id))
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Verification result not found")
+    verification = _verification_response_from_result(stored)
+    bogus_findings = _get_bogus_findings_for_doc(session, doc_id)
+    return _build_risk_report(verification=verification, bogus_findings=bogus_findings)
+
+
+@app.get(
+    "/reports/{doc_id}/verification-with-risk",
+    response_model=VerificationWithRiskResponse,
+)
+def get_report_verification_with_risk(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> VerificationWithRiskResponse:
+    stored = get_latest_verification_result(session, doc_id=str(doc_id))
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Verification result not found")
+    verification = _verification_response_from_result(stored)
+    bogus_findings = _get_bogus_findings_for_doc(session, doc_id)
+    risk = _build_risk_report(verification=verification, bogus_findings=bogus_findings)
+    return VerificationWithRiskResponse(verification=verification, risk=risk)
+
+
+@app.get("/reports/{doc_id}/export.pdf")
+def export_report_pdf(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> Response:
+    stored = get_latest_verification_result(session, doc_id=str(doc_id))
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Verification result not found")
+    verification = _verification_response_from_result(stored)
+    bogus_findings = _get_bogus_findings_for_doc(session, doc_id)
+    risk = _build_risk_report(verification=verification, bogus_findings=bogus_findings)
+
+    try:
+        from reportlab.lib.pagesizes import LETTER
+        from reportlab.pdfgen import canvas
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500, detail="reportlab is required for PDF export"
+        ) from exc
+
+    buffer = BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=LETTER, invariant=1)
+    width, height = LETTER
+    margin = 48
+    y = height - margin
+
+    def write_line(text: str, *, size: int = 10, step: int = 14) -> None:
+        nonlocal y
+        if y <= margin:
+            pdf.showPage()
+            y = height - margin
+        pdf.setFont("Helvetica", size)
+        pdf.drawString(margin, y, _normalize_ws(text))
+        y -= step
+
+    write_line("Debriev Verification Export", size=14, step=20)
+    write_line(f"Report ID: {doc_id}", size=10, step=14)
+    write_line(
+        f"Verification created: {stored.created_at.isoformat()}", size=10, step=16
+    )
+
+    write_line(
+        (
+            f"Totals - verified: {risk.totals.verified}, "
+            f"ambiguous: {risk.totals.ambiguous}, "
+            f"not_found: {risk.totals.not_found}, "
+            f"bogus: {risk.totals.bogus}"
+        ),
+        size=10,
+        step=14,
+    )
+    write_line(f"Risk score: {risk.score}", size=10, step=18)
+    write_line("Top risky citations:", size=11, step=16)
+
+    for item in risk.top_risks[:20]:
+        write_line(
+            f"- {item.citation} [{item.status}]"
+            + (f" ({item.bogus_reason})" if item.bogus_reason else ""),
+            size=10,
+            step=14,
+        )
+        if item.probable_case_name:
+            write_line(
+                f"  probable_case_name: {item.probable_case_name}", size=9, step=12
+            )
+        if item.link:
+            write_line(f"  link: {item.link}", size=9, step=12)
+        if item.evidence:
+            evidence = item.evidence
+            if len(evidence) > 220:
+                evidence = f"{evidence[:219].rstrip()}…"
+            write_line(f"  evidence: {evidence}", size=9, step=12)
+
+    pdf.showPage()
+    pdf.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="report-{doc_id}.pdf"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post(
@@ -1553,18 +1997,7 @@ def get_report(doc_id: UUID, session: Session = Depends(get_session)) -> dict[st
 def get_report_bogus(
     doc_id: UUID, session: Session = Depends(get_session)
 ) -> list[ChatFinding]:
-    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
-    if document is None:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    source_text = document.stub_text or ""
-    if not _normalize_ws(source_text):
-        return []
-
-    findings = _extract_bogus_case_findings(
-        [{"doc_id": str(doc_id), "chunk_id": f"{doc_id}:stub", "text": source_text}]
-    )
-    return _to_chat_findings(findings)
+    return _get_bogus_findings_for_doc(session, doc_id)
 
 
 _CASE_WORD = r"[A-Z](?:[A-Za-z0-9&'-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9&'-]+)*\.?"
@@ -2614,6 +3047,7 @@ def _courtlistener_raw_to_findings(
     evidence_by_citation: dict[str, str] | None = None,
     probable_case_name_by_citation: dict[str, str | None] | None = None,
 ) -> list[CitationVerificationFinding]:
+    candidate_limit = 5
     by_citation: dict[str, dict[str, Any]] = {}
     if requested_citations:
         for requested in requested_citations:
@@ -2660,6 +3094,7 @@ def _courtlistener_raw_to_findings(
         candidates = list(by_citation[citation_key]["results"])
         candidate_count = len(candidates)
         best_match: BestMatch | None = None
+        candidate_matches: list[BestMatch] = []
 
         if candidate_count == 0:
             status = "not_found"
@@ -2667,6 +3102,8 @@ def _courtlistener_raw_to_findings(
             explanation = "No CourtListener matches were returned for this citation."
         elif candidate_count == 1:
             best_match = _to_best_match(candidates[0], fallback_citation=citation)
+            if best_match is not None:
+                candidate_matches = [best_match]
             matched_citation = (
                 best_match.matched_citation if best_match is not None else None
             )
@@ -2682,9 +3119,13 @@ def _courtlistener_raw_to_findings(
             )
         else:
             ordered_candidates = sorted(candidates, key=_candidate_sort_key)
-            best_match = _to_best_match(
-                ordered_candidates[0], fallback_citation=citation
-            )
+            for candidate in ordered_candidates[:candidate_limit]:
+                normalized_candidate = _to_best_match(
+                    candidate, fallback_citation=citation
+                )
+                if normalized_candidate is not None:
+                    candidate_matches.append(normalized_candidate)
+            best_match = candidate_matches[0] if candidate_matches else None
             status = "ambiguous"
             confidence = 0.5
             explanation = (
@@ -2697,6 +3138,7 @@ def _courtlistener_raw_to_findings(
                 status=status,
                 confidence=confidence,
                 best_match=best_match,
+                candidates=candidate_matches,
                 explanation=explanation,
                 evidence=(
                     evidence_by_citation.get(citation_key, "")

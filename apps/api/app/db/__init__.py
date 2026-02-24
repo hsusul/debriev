@@ -19,6 +19,7 @@ from .models import (
     Citation,
     CitationVerification,
     Document,
+    ExtractedCitations,
     Project,
     Report,
     VerificationJob,
@@ -80,14 +81,74 @@ def list_verification_results(
     ).all()
 
 
+def store_extracted_citations(
+    session: Session,
+    *,
+    doc_id: str,
+    citations: list[str],
+    evidence_map: dict[str, str],
+    probable_case_name_map: dict[str, str | None],
+) -> ExtractedCitations:
+    existing = session.exec(
+        select(ExtractedCitations).where(ExtractedCitations.doc_id == doc_id)
+    ).first()
+
+    now = datetime.now(UTC)
+    citations_json = json.dumps(citations, sort_keys=True)
+    evidence_json = json.dumps(
+        {key: evidence_map[key] for key in sorted(evidence_map)},
+        sort_keys=True,
+    )
+    probable_json = json.dumps(
+        {key: probable_case_name_map[key] for key in sorted(probable_case_name_map)},
+        sort_keys=True,
+    )
+
+    if existing is not None:
+        existing.citations_json = citations_json
+        existing.evidence_json = evidence_json
+        existing.probable_case_name_json = probable_json
+        existing.updated_at = now
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        return existing
+
+    created = ExtractedCitations(
+        doc_id=doc_id,
+        citations_json=citations_json,
+        evidence_json=evidence_json,
+        probable_case_name_json=probable_json,
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(created)
+    session.commit()
+    session.refresh(created)
+    return created
+
+
+def get_latest_extracted_citations(
+    session: Session, *, doc_id: str
+) -> ExtractedCitations | None:
+    return session.exec(
+        select(ExtractedCitations)
+        .where(ExtractedCitations.doc_id == doc_id)
+        .order_by(ExtractedCitations.updated_at.desc(), ExtractedCitations.id.desc())
+    ).first()
+
+
 __all__ = [
     "Project",
     "Document",
     "Report",
     "Citation",
     "CitationVerification",
+    "ExtractedCitations",
     "VerificationJob",
     "VerificationResult",
+    "store_extracted_citations",
+    "get_latest_extracted_citations",
     "store_verification_result",
     "get_latest_verification_result",
     "list_verification_results",
