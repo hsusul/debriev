@@ -21,6 +21,39 @@ Services:
 - API: `localhost:8000`
 - Web: `localhost:3000`
 
+## Local Development
+
+### Two-terminal workflow
+
+Terminal 1:
+```bash
+cd apps/api
+./.venv/bin/python -m uvicorn app.main:app --reload --port 8000
+```
+
+Terminal 2:
+```bash
+cd apps/web
+npm run dev
+```
+
+Optional worker terminal:
+```bash
+cd apps/api
+./.venv/bin/python -m app.worker
+```
+
+### One-command workflow (repo root)
+
+```bash
+npm run dev:all
+```
+
+Additional root scripts:
+- `npm run dev:web`
+- `npm run dev:api`
+- `npm run dev:worker`
+
 ## Smoke Test
 1. Open `http://localhost:3000/upload`.
 2. Upload a PDF containing case citations.

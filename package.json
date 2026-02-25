@@ -1,6 +1,13 @@
 {
+  "scripts": {
+    "dev:web": "cd apps/web && npm run dev",
+    "dev:api": "cd apps/api && ./.venv/bin/python -m uvicorn app.main:app --reload --port 8000",
+    "dev:worker": "cd apps/api && ./.venv/bin/python -m app.worker",
+    "dev:all": "concurrently -k -n api,worker,web -c green,cyan,magenta \"npm run dev:api\" \"npm run dev:worker\" \"npm run dev:web\""
+  },
   "devDependencies": {
     "autoprefixer": "^10.4.24",
+    "concurrently": "^9.2.1",
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18"
   },

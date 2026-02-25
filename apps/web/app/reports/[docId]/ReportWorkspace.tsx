@@ -5,7 +5,7 @@ import { Document, Page, pdfjs } from "react-pdf";
 
 import VerifyButton from "./VerifyButton";
 
-pdfjs.GlobalWorkerOptions.workerSrc = `//unpkg.com/pdfjs-dist@${pdfjs.version}/build/pdf.worker.min.mjs`;
+pdfjs.GlobalWorkerOptions.workerSrc = "/pdf-worker";
 
 type VerificationDetails = {
   courtlistener_url?: string;
@@ -253,6 +253,18 @@ async function createVerificationJob(docId: string, payload: { text?: string }):
   return (await response.json()) as VerificationJobCreateResponse;
 }
 
+async function createRunJob(docId: string): Promise<VerificationJobCreateResponse> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/run`, {
+    method: "POST"
+  });
+
+  if (!response.ok) {
+    throw new Error(await parseApiError(response, "Failed to start report run"));
+  }
+
+  return (await response.json()) as VerificationJobCreateResponse;
+}
+
 async function fetchVerificationJobStatus(docId: string, jobId: string): Promise<VerificationJobStatusResponse> {
   const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/verification/jobs/${jobId}`, {
     method: "GET"
@@ -263,6 +275,42 @@ async function fetchVerificationJobStatus(docId: string, jobId: string): Promise
   }
 
   return (await response.json()) as VerificationJobStatusResponse;
+}
+
+async function pollVerificationJob(
+  docId: string,
+  jobId: string,
+  setStatusText: (value: string) => void,
+): Promise<VerificationJobStatusResponse> {
+  let finalStatus: VerificationJobStatusResponse | null = null;
+
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 1000);
+    });
+    const status = await fetchVerificationJobStatus(docId, jobId);
+    finalStatus = status;
+
+    if (status.status === "queued") {
+      setStatusText(`Verification job ${status.job_id} queued...`);
+      continue;
+    }
+    if (status.status === "running") {
+      setStatusText(`Verification job ${status.job_id} running...`);
+      continue;
+    }
+    if (status.status === "failed") {
+      throw new Error(status.error_text || "Verification job failed");
+    }
+    if (status.status === "done") {
+      return status;
+    }
+  }
+
+  if (finalStatus?.status === "done") {
+    return finalStatus;
+  }
+  throw new Error("Verification job timed out before completion.");
 }
 
 function normalizeCitationKey(value: string | null | undefined): string {
@@ -513,6 +561,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const [bogusFindings, setBogusFindings] = useState<BogusFinding[]>([]);
   const [activeHistoryId, setActiveHistoryId] = useState<number | null>(null);
   const [jobStatusText, setJobStatusText] = useState("");
+  const [runLoading, setRunLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>("risk_desc");
@@ -707,7 +756,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     return `${PUBLIC_API_BASE}/${raw}`;
   }, [docId, overview?.export_endpoints?.pdf_url]);
 
-  const pdfUrl = `${PUBLIC_API_BASE}/v1/documents/${docId}/pdf`;
+  const pdfUrl = `${PUBLIC_API_BASE}/reports/${docId}/pdf`;
 
   const onDocumentLoadSuccess = async (pdf: any) => {
     setNumPages(pdf.numPages);
@@ -723,6 +772,25 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     }
     setPageText(textByPage);
   };
+
+  const onPdfLoadError = useCallback(
+    (error: Error) => {
+      const fallbackMessage = error.message ? `Failed to load PDF: ${error.message}` : "Failed to load PDF";
+      void (async () => {
+        try {
+          const response = await fetch(pdfUrl, { method: "GET" });
+          if (!response.ok) {
+            setPdfError(await parseApiError(response, "Failed to load PDF"));
+            return;
+          }
+        } catch {
+          // keep fallback message
+        }
+        setPdfError(fallbackMessage);
+      })();
+    },
+    [pdfUrl],
+  );
 
   const jumpToCitation = (citation: ReportCitation, idx: number) => {
     setSelectedCitationIndex(idx);
@@ -769,37 +837,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
         text: verificationText
       });
       setJobStatusText(`Verification job ${created.job_id} queued...`);
-
-      let finalStatus: VerificationJobStatusResponse | null = null;
-      for (let attempt = 0; attempt < 180; attempt += 1) {
-        await new Promise((resolve) => {
-          setTimeout(resolve, 1000);
-        });
-        const status = await fetchVerificationJobStatus(docId, created.job_id);
-        finalStatus = status;
-
-        if (status.status === "queued") {
-          setJobStatusText(`Verification job ${status.job_id} queued...`);
-          continue;
-        }
-        if (status.status === "running") {
-          setJobStatusText(`Verification job ${status.job_id} running...`);
-          continue;
-        }
-        if (status.status === "failed") {
-          const message = status.error_text || "Verification job failed";
-          setJobStatusText("");
-          throw new Error(message);
-        }
-        if (status.status === "done") {
-          break;
-        }
-      }
-
-      if (finalStatus === null || finalStatus.status !== "done") {
-        setJobStatusText("");
-        throw new Error("Verification job timed out before completion.");
-      }
+      await pollVerificationJob(docId, created.job_id, setJobStatusText);
 
       await loadOverview();
       setJobStatusText("Verification complete.");
@@ -807,6 +845,23 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
       const message = err instanceof Error ? err.message : "Verification request failed";
       setVerificationBannerError(message);
       throw err;
+    }
+  };
+
+  const onRun = async () => {
+    setVerificationBannerError("");
+    setRunLoading(true);
+    try {
+      const created = await createRunJob(docId);
+      setJobStatusText(`Run job ${created.job_id} queued...`);
+      await pollVerificationJob(docId, created.job_id, setJobStatusText);
+      await loadOverview();
+      setJobStatusText("Run complete.");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Run request failed";
+      setVerificationBannerError(message);
+    } finally {
+      setRunLoading(false);
     }
   };
 
@@ -843,6 +898,14 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
       <div className="rounded-2xl border border-slate-700/70 bg-slate-900/70 p-4">
         <div className="mb-3 flex flex-wrap items-center gap-2">
           <VerifyButton onVerify={onVerify} label="Verify" />
+          <button
+            type="button"
+            onClick={() => void onRun()}
+            disabled={runLoading}
+            className="rounded-lg border border-blue-700 bg-blue-900/40 px-3 py-2 text-sm font-medium text-blue-100 transition hover:bg-blue-800/50 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {runLoading ? "Running..." : "Run (Extract + Verify)"}
+          </button>
           <button
             type="button"
             onClick={() =>
@@ -977,7 +1040,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
 
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
         <div className="max-h-[75vh] overflow-auto rounded-2xl border border-slate-700/70 bg-slate-900/70 p-2">
-          <Document file={pdfUrl} onLoadSuccess={onDocumentLoadSuccess} onLoadError={() => setPdfError("Failed to load PDF")}>
+          <Document file={pdfUrl} onLoadSuccess={onDocumentLoadSuccess} onLoadError={onPdfLoadError}>
             {Array.from({ length: numPages }, (_, index) => {
               const pageNumber = index + 1;
               return (

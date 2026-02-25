@@ -48,7 +48,9 @@ from app.main import (
     get_report_verification_history,
     get_verification_job_status,
     get_report_verification,
+    get_report_pdf,
     metrics_simple,
+    run_report,
     verify_citations,
     verify_citations_extracted,
 )
@@ -746,6 +748,84 @@ def test_get_report_verification_by_id_returns_specific_run(tmp_path: Path) -> N
         "not_found": 1,
         "ambiguous": 0,
     }
+
+
+def test_get_report_pdf_returns_pdf_content_type(tmp_path: Path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_uuid = uuid4()
+        pdf_path = tmp_path / "fixture.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%fixture\n")
+        session.add(
+            Document(
+                doc_id=doc_uuid,
+                filename="fixture.pdf",
+                file_path=str(pdf_path),
+                stub_text="fixture",
+            )
+        )
+        session.commit()
+
+        response = get_report_pdf(doc_id=doc_uuid, session=session)
+
+    assert response.media_type == "application/pdf"
+    assert "inline" in response.headers.get("content-disposition", "").lower()
+
+
+def test_run_report_returns_job_id_and_job_progresses(tmp_path: Path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = _insert_document_with_report(session)
+        response = run_report(
+            doc_id=UUID(doc_id),
+            background_tasks=BackgroundTasks(),
+            session=session,
+        )
+        assert response.status == "queued"
+        assert response.job_id
+
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            return_value={
+                "results": [
+                    {
+                        "citation": "410 U.S. 113",
+                        "results": [{"citation": "410 U.S. 113"}],
+                    }
+                ]
+            },
+        ):
+            _execute_verification_job(response.job_id, None, session)
+
+        job_status = get_verification_job_status(
+            doc_id=UUID(doc_id),
+            job_id=response.job_id,
+            session=session,
+        )
+
+    assert job_status.status == "done"
+    assert job_status.result_id is not None
+
+
+def test_run_report_is_idempotent_for_existing_queued_job(tmp_path: Path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = _insert_document_with_report(session)
+        first = run_report(
+            doc_id=UUID(doc_id),
+            background_tasks=BackgroundTasks(),
+            session=session,
+        )
+        second = run_report(
+            doc_id=UUID(doc_id),
+            background_tasks=BackgroundTasks(),
+            session=session,
+        )
+        jobs = session.exec(
+            select(VerificationJob)
+            .where(VerificationJob.doc_id == doc_id)
+            .where(VerificationJob.status.in_(["queued", "running"]))
+        ).all()
+
+    assert first.job_id == second.job_id
+    assert len(jobs) == 1
 
 
 def test_verification_job_creation_returns_queued(tmp_path: Path) -> None:

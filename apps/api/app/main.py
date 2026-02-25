@@ -1708,6 +1708,55 @@ def get_report_overview(
     )
 
 
+@app.post("/reports/{doc_id}/run", response_model=VerificationJobCreateResponse)
+def run_report(
+    doc_id: UUID,
+    background_tasks: BackgroundTasks,
+    session: Session = Depends(get_session),
+) -> VerificationJobCreateResponse:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    doc_id_str = str(doc_id)
+    extracted = _get_persisted_extracted_citations(session=session, doc_id=doc_id_str)
+    if extracted is not None and extracted.citations:
+        text_payload = "\n".join(extracted.citations)
+    else:
+        text_payload = _build_doc_verification_text(session=session, doc_id=doc_id)
+
+    normalized_payload = _normalize_ws(text_payload)
+    existing_job = session.exec(
+        select(VerificationJob)
+        .where(VerificationJob.doc_id == doc_id_str)
+        .where(VerificationJob.status.in_(["queued", "running"]))
+        .order_by(VerificationJob.created_at.asc(), VerificationJob.id.asc())
+    ).all()
+    for job in existing_job:
+        if _normalize_ws(job.input_text or "") == normalized_payload:
+            return VerificationJobCreateResponse(job_id=job.id, status=job.status)
+
+    job = VerificationJob(
+        doc_id=doc_id_str,
+        status="queued",
+        input_text=text_payload,
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+
+    bind = session.get_bind()
+    database_url = str(bind.url) if bind is not None else None
+    background_tasks.add_task(
+        _run_verification_job_background,
+        job.id,
+        text_payload,
+        database_url,
+    )
+
+    return VerificationJobCreateResponse(job_id=job.id, status=job.status)
+
+
 @app.get("/reports/{doc_id}/export.pdf")
 def export_report_pdf(
     doc_id: UUID, session: Session = Depends(get_session)
@@ -2076,6 +2125,28 @@ def get_document_pdf(
 
     return FileResponse(
         str(file_path), media_type="application/pdf", filename=document.filename
+    )
+
+
+@app.get("/reports/{doc_id}/pdf")
+def get_report_pdf(
+    doc_id: UUID, session: Session = Depends(get_session)
+) -> FileResponse:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    file_path = Path(document.file_path)
+    if not file_path.is_file() or file_path.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=404, detail="PDF not found")
+
+    return FileResponse(
+        str(file_path),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{document.filename}"',
+            "Cache-Control": "no-store",
+        },
     )
 
 
