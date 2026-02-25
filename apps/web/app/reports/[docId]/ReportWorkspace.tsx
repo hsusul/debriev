@@ -37,6 +37,7 @@ type BestMatch = {
 };
 
 type CitationVerificationFinding = {
+  citation_id: string;
   citation: string;
   status: "verified" | "not_found" | "ambiguous";
   confidence: number;
@@ -78,6 +79,7 @@ type RiskTotals = {
 };
 
 type RiskItem = {
+  citation_id: string;
   citation: string;
   status: string;
   bogus_reason: string | null;
@@ -107,8 +109,55 @@ type ReportOverviewExportEndpoints = {
 
 type ExtractedCitationsResponse = {
   citations: string[];
+  citation_ids: Record<string, string>;
   evidence: Record<string, string>;
   probable_case_name: Record<string, string | null>;
+};
+
+type CitationOverrideCandidate = {
+  url?: string | null;
+  case_name?: string | null;
+  year?: number | null;
+};
+
+type CitationOverrideResponse = {
+  id: number;
+  doc_id: string;
+  citation_id: string;
+  chosen_url: string | null;
+  chosen_case_name: string | null;
+  chosen_year: number | null;
+  created_at: string;
+};
+
+type VerificationDiffStatusChange = {
+  citation_id: string;
+  citation: string;
+  left_status: string;
+  right_status: string;
+};
+
+type VerificationDiffBestMatchChange = {
+  citation_id: string;
+  citation: string;
+  left_best_match: BestMatch | null;
+  right_best_match: BestMatch | null;
+};
+
+type VerificationDiffSummary = {
+  left_total: number;
+  right_total: number;
+  delta_verified: number;
+  delta_not_found: number;
+  delta_ambiguous: number;
+};
+
+type VerificationDiffResponse = {
+  left_id: number;
+  right_id: number;
+  summary_changes: VerificationDiffSummary;
+  status_changes: VerificationDiffStatusChange[];
+  best_match_changes: VerificationDiffBestMatchChange[];
 };
 
 type ReportOverviewResponse = {
@@ -141,6 +190,7 @@ type SortMode = "risk_desc" | "citation_asc";
 type CitationRow = {
   citation: ReportCitation;
   idx: number;
+  citationId: string | null;
   finding: CitationVerificationFinding | null;
   relatedBogus: boolean;
   riskItem: RiskItem | null;
@@ -237,6 +287,52 @@ async function fetchVerificationResultById(docId: string, resultId: number): Pro
   return (await response.json()) as VerifyCitationsResponse;
 }
 
+async function fetchReportOverrides(docId: string): Promise<CitationOverrideResponse[]> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/overrides`, {
+    method: "GET"
+  });
+
+  if (!response.ok) {
+    throw new Error(await parseApiError(response, "Failed to load overrides"));
+  }
+
+  return (await response.json()) as CitationOverrideResponse[];
+}
+
+async function createCitationOverride(
+  docId: string,
+  payload: { citation_id: string; chosen_candidate: CitationOverrideCandidate },
+): Promise<CitationOverrideResponse> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/overrides`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    throw new Error(await parseApiError(response, "Failed to save override"));
+  }
+
+  return (await response.json()) as CitationOverrideResponse;
+}
+
+async function fetchVerificationDiff(
+  docId: string,
+  leftId: number,
+  rightId: number,
+): Promise<VerificationDiffResponse> {
+  const response = await fetch(
+    `${PUBLIC_API_BASE}/reports/${docId}/verification/diff?left_id=${leftId}&right_id=${rightId}`,
+    { method: "GET" },
+  );
+  if (!response.ok) {
+    throw new Error(await parseApiError(response, "Failed to load verification diff"));
+  }
+  return (await response.json()) as VerificationDiffResponse;
+}
+
 async function createVerificationJob(docId: string, payload: { text?: string }): Promise<VerificationJobCreateResponse> {
   const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/verification/jobs`, {
     method: "POST",
@@ -317,48 +413,34 @@ function normalizeCitationKey(value: string | null | undefined): string {
   return normalizeWhitespace(value || "").replace(/[^\w\s.]/g, "");
 }
 
-function findMatchingFinding(
+function resolveCitationId(
   citation: ReportCitation,
-  findings: CitationVerificationFinding[],
-): CitationVerificationFinding | null {
+  extracted: ExtractedCitationsResponse | null,
+): string | null {
+  if (!extracted || extracted.citations.length === 0) {
+    return null;
+  }
   const rawKey = normalizeCitationKey(citation.raw);
   const contextKey = normalizeCitationKey(citation.context_text || "");
-
-  for (const finding of findings) {
-    const citationKey = normalizeCitationKey(finding.citation);
-    if (!citationKey) {
-      continue;
+  const matches = extracted.citations.filter((candidate) => {
+    const candidateKey = normalizeCitationKey(candidate);
+    if (!candidateKey) {
+      return false;
     }
-    if (rawKey === citationKey || rawKey.includes(citationKey) || contextKey.includes(citationKey)) {
-      return finding;
-    }
+    return rawKey.includes(candidateKey) || contextKey.includes(candidateKey);
+  });
+  if (matches.length === 0) {
+    return null;
   }
-
-  for (const finding of findings) {
-    const probable = normalizeCitationKey(finding.probable_case_name);
-    if (probable && probable === rawKey) {
-      return finding;
+  matches.sort((a, b) => {
+    const byLength = b.length - a.length;
+    if (byLength !== 0) {
+      return byLength;
     }
-  }
-
-  return null;
-}
-
-function findMatchingRiskItem(citation: ReportCitation, risks: RiskItem[]): RiskItem | null {
-  const rawKey = normalizeCitationKey(citation.raw);
-  const contextKey = normalizeCitationKey(citation.context_text || "");
-
-  for (const risk of risks) {
-    const citationKey = normalizeCitationKey(risk.citation);
-    if (!citationKey) {
-      continue;
-    }
-    if (rawKey === citationKey || rawKey.includes(citationKey) || contextKey.includes(citationKey)) {
-      return risk;
-    }
-  }
-
-  return null;
+    return normalizeCitationKey(a).localeCompare(normalizeCitationKey(b));
+  });
+  const selected = matches[0];
+  return extracted.citation_ids[selected] || null;
 }
 
 function truncateSnippet(value: string, maxLength = 160): string {
@@ -559,9 +641,15 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const [verification, setVerification] = useState<VerifyCitationsResponse | null>(null);
   const [verificationBannerError, setVerificationBannerError] = useState("");
   const [bogusFindings, setBogusFindings] = useState<BogusFinding[]>([]);
+  const [overrides, setOverrides] = useState<CitationOverrideResponse[]>([]);
   const [activeHistoryId, setActiveHistoryId] = useState<number | null>(null);
   const [jobStatusText, setJobStatusText] = useState("");
   const [runLoading, setRunLoading] = useState(false);
+  const [overrideSavingCitationId, setOverrideSavingCitationId] = useState<string | null>(null);
+  const [compareLeftId, setCompareLeftId] = useState<number | null>(null);
+  const [compareRightId, setCompareRightId] = useState<number | null>(null);
+  const [compareDiff, setCompareDiff] = useState<VerificationDiffResponse | null>(null);
+  const [compareLoading, setCompareLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [sortMode, setSortMode] = useState<SortMode>("risk_desc");
@@ -569,11 +657,17 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
   const loadOverview = useCallback(async () => {
-    const data = await fetchReportOverview(docId);
+    const [data, overrideRows] = await Promise.all([fetchReportOverview(docId), fetchReportOverrides(docId)]);
     setOverview(data);
     setVerification(data.latest_verification);
     setBogusFindings(data.bogus_findings);
+    setOverrides(
+      overrideRows
+        .slice()
+        .sort((a, b) => a.citation_id.localeCompare(b.citation_id) || b.id - a.id),
+    );
     setActiveHistoryId(null);
+    setCompareDiff(null);
   }, [docId]);
 
   useEffect(() => {
@@ -581,13 +675,18 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
 
     const run = async () => {
       try {
-        const data = await fetchReportOverview(docId);
+        const [data, overrideRows] = await Promise.all([fetchReportOverview(docId), fetchReportOverrides(docId)]);
         if (cancelled) {
           return;
         }
         setOverview(data);
         setVerification(data.latest_verification);
         setBogusFindings(data.bogus_findings);
+        setOverrides(
+          overrideRows
+            .slice()
+            .sort((a, b) => a.citation_id.localeCompare(b.citation_id) || b.id - a.id),
+        );
         setActiveHistoryId(null);
       } catch (err) {
         if (!cancelled) {
@@ -604,11 +703,36 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   }, [docId]);
 
   const riskItems = useMemo(() => overview?.risk_report?.top_risks || [], [overview?.risk_report?.top_risks]);
+  const extractedCitations = overview?.extracted_citations || null;
+  const findingByCitationId = useMemo(() => {
+    const map = new Map<string, CitationVerificationFinding>();
+    for (const finding of verification?.findings || []) {
+      map.set(finding.citation_id, finding);
+    }
+    return map;
+  }, [verification?.findings]);
+  const riskByCitationId = useMemo(() => {
+    const map = new Map<string, RiskItem>();
+    for (const item of riskItems) {
+      map.set(item.citation_id, item);
+    }
+    return map;
+  }, [riskItems]);
+  const overrideByCitationId = useMemo(() => {
+    const map = new Map<string, CitationOverrideResponse>();
+    for (const row of overrides) {
+      if (!map.has(row.citation_id)) {
+        map.set(row.citation_id, row);
+      }
+    }
+    return map;
+  }, [overrides]);
 
   const citationRows = useMemo(() => {
     return report.citations.map((citation, idx): CitationRow => {
-      const finding = verification ? findMatchingFinding(citation, verification.findings) : null;
-      const riskItem = findMatchingRiskItem(citation, riskItems);
+      const citationId = resolveCitationId(citation, extractedCitations);
+      const finding = citationId ? findingByCitationId.get(citationId) || null : null;
+      const riskItem = citationId ? riskByCitationId.get(citationId) || null : null;
       const relatedBogus = bogusFindings.some((item) => {
         const findingKey = normalizeCitationKey(item.case_name);
         const raw = normalizeCitationKey(citation.raw);
@@ -621,18 +745,19 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
       return {
         citation,
         idx,
+        citationId,
         finding,
         relatedBogus,
         riskItem,
         effectiveStatus
       };
     });
-  }, [bogusFindings, report.citations, riskItems, verification]);
+  }, [bogusFindings, extractedCitations, findingByCitationId, report.citations, riskByCitationId]);
 
   const riskRankByCitation = useMemo(() => {
     const map = new Map<string, number>();
     riskItems.forEach((item, index) => {
-      map.set(normalizeCitationKey(item.citation), riskItems.length - index);
+      map.set(item.citation_id, riskItems.length - index);
     });
     return map;
   }, [riskItems]);
@@ -669,8 +794,8 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
         return a.idx - b.idx;
       }
 
-      const leftKey = normalizeCitationKey(a.finding?.citation || a.citation.raw);
-      const rightKey = normalizeCitationKey(b.finding?.citation || b.citation.raw);
+      const leftKey = a.citationId || normalizeCitationKey(a.finding?.citation || a.citation.raw);
+      const rightKey = b.citationId || normalizeCitationKey(b.finding?.citation || b.citation.raw);
       const leftRiskRank = riskRankByCitation.get(leftKey) || 0;
       const rightRiskRank = riskRankByCitation.get(rightKey) || 0;
       const leftSeverity = statusSeverity(a.effectiveStatus, a.relatedBogus);
@@ -720,6 +845,10 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     }
     return citationRows.find((row) => row.idx === selectedCitationIndex)?.finding || null;
   }, [citationRows, selectedCitationIndex]);
+  const selectedOverride = useMemo(
+    () => (selectedFinding ? overrideByCitationId.get(selectedFinding.citation_id) || null : null),
+    [overrideByCitationId, selectedFinding],
+  );
 
   const highlightTerms = useMemo(() => {
     const terms = report.citations.map((citation) => citation.raw);
@@ -728,13 +857,6 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     }
     return terms;
   }, [report.citations, verification]);
-
-  const verificationText = useMemo(() => {
-    const pieces = report.citations
-      .map((citation) => [citation.raw, citation.context_text || ""].filter(Boolean).join("\n"))
-      .filter((piece) => piece.trim().length > 0);
-    return pieces.join("\n\n");
-  }, [report.citations]);
 
   const verificationHistory = useMemo(() => {
     const rows = overview?.verification_history || [];
@@ -828,14 +950,8 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const onVerify = async () => {
     setVerificationBannerError("");
 
-    if (!verificationText.trim()) {
-      throw new Error("No extracted citation text available to verify.");
-    }
-
     try {
-      const created = await createVerificationJob(docId, {
-        text: verificationText
-      });
+      const created = await createVerificationJob(docId, {});
       setJobStatusText(`Verification job ${created.job_id} queued...`);
       await pollVerificationJob(docId, created.job_id, setJobStatusText);
 
@@ -890,6 +1006,62 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to load verification run";
       setVerificationBannerError(message);
+    }
+  };
+
+  useEffect(() => {
+    if (verificationHistory.length === 0) {
+      setCompareLeftId(null);
+      setCompareRightId(null);
+      setCompareDiff(null);
+      return;
+    }
+    const newest = verificationHistory[0]?.id ?? null;
+    const second = verificationHistory[1]?.id ?? newest;
+    setCompareLeftId((prev) => prev ?? newest);
+    setCompareRightId((prev) => prev ?? second);
+  }, [verificationHistory]);
+
+  const onCompareRuns = async () => {
+    if (compareLeftId === null || compareRightId === null) {
+      return;
+    }
+    setCompareLoading(true);
+    setVerificationBannerError("");
+    try {
+      const diff = await fetchVerificationDiff(docId, compareLeftId, compareRightId);
+      setCompareDiff(diff);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to compare runs";
+      setVerificationBannerError(message);
+      setCompareDiff(null);
+    } finally {
+      setCompareLoading(false);
+    }
+  };
+
+  const onSelectCandidate = async (finding: CitationVerificationFinding, candidate: BestMatch) => {
+    setVerificationBannerError("");
+    setOverrideSavingCitationId(finding.citation_id);
+    try {
+      await createCitationOverride(docId, {
+        citation_id: finding.citation_id,
+        chosen_candidate: {
+          url: candidate.url,
+          case_name: candidate.case_name,
+          year: candidate.year
+        }
+      });
+      await loadOverview();
+      if (activeHistoryId !== null) {
+        const result = await fetchVerificationResultById(docId, activeHistoryId);
+        setVerification(result);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to save override";
+      setVerificationBannerError(message);
+    } finally {
+      setOverrideSavingCitationId(null);
     }
   };
 
@@ -1038,6 +1210,83 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
         )}
       </section>
 
+      <section className="rounded-2xl border border-slate-700/70 bg-slate-900/60 p-4 text-sm text-slate-200">
+        <h3 className="text-sm font-semibold text-slate-100">Compare runs</h3>
+        <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_1fr_auto]">
+          <select
+            value={compareLeftId ?? ""}
+            onChange={(event) => setCompareLeftId(event.target.value ? Number(event.target.value) : null)}
+            className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200"
+          >
+            <option value="">Left run</option>
+            {verificationHistory.map((item) => (
+              <option key={`left-${item.id}`} value={item.id}>
+                #{item.id} - {formatHistoryTimestamp(item.created_at)}
+              </option>
+            ))}
+          </select>
+          <select
+            value={compareRightId ?? ""}
+            onChange={(event) => setCompareRightId(event.target.value ? Number(event.target.value) : null)}
+            className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200"
+          >
+            <option value="">Right run</option>
+            {verificationHistory.map((item) => (
+              <option key={`right-${item.id}`} value={item.id}>
+                #{item.id} - {formatHistoryTimestamp(item.created_at)}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            onClick={() => void onCompareRuns()}
+            disabled={compareLoading || compareLeftId === null || compareRightId === null}
+            className="rounded-md border border-slate-700 bg-slate-800 px-3 py-1 text-xs text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {compareLoading ? "Comparing..." : "Compare"}
+          </button>
+        </div>
+        {compareDiff ? (
+          <div className="mt-3 space-y-2 rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-xs">
+            <p className="text-slate-300">
+              Δ verified {compareDiff.summary_changes.delta_verified}, Δ not_found {compareDiff.summary_changes.delta_not_found}, Δ ambiguous{" "}
+              {compareDiff.summary_changes.delta_ambiguous}
+            </p>
+            <p className="text-slate-400">
+              Left total {compareDiff.summary_changes.left_total} / Right total {compareDiff.summary_changes.right_total}
+            </p>
+            <div>
+              <p className="font-medium text-slate-200">Status changes ({compareDiff.status_changes.length})</p>
+              {compareDiff.status_changes.length === 0 ? (
+                <p className="text-slate-400">None</p>
+              ) : (
+                <ul className="mt-1 list-disc pl-5 text-slate-300">
+                  {compareDiff.status_changes.slice(0, 20).map((item) => (
+                    <li key={`status-${item.citation_id}`}>
+                      {item.citation}: {item.left_status} → {item.right_status}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div>
+              <p className="font-medium text-slate-200">Best match changes ({compareDiff.best_match_changes.length})</p>
+              {compareDiff.best_match_changes.length === 0 ? (
+                <p className="text-slate-400">None</p>
+              ) : (
+                <ul className="mt-1 list-disc pl-5 text-slate-300">
+                  {compareDiff.best_match_changes.slice(0, 20).map((item) => (
+                    <li key={`match-${item.citation_id}`}>
+                      {item.citation}: {item.left_best_match?.case_name || "-"} → {item.right_best_match?.case_name || "-"}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </section>
+
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(320px,1fr)]">
         <div className="max-h-[75vh] overflow-auto rounded-2xl border border-slate-700/70 bg-slate-900/70 p-2">
           <Document file={pdfUrl} onLoadSuccess={onDocumentLoadSuccess} onLoadError={onPdfLoadError}>
@@ -1181,8 +1430,20 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
               <p className="font-semibold uppercase tracking-wide text-slate-400">Citation Details</p>
               <div className="mt-2 space-y-2">
                 <p>
+                  <span className="text-slate-400">Citation ID:</span>{" "}
+                  <span className="text-slate-100">{selectedFinding?.citation_id || "-"}</span>
+                </p>
+                <p>
                   <span className="text-slate-400">Probable case name:</span>{" "}
                   <span className="text-slate-100">{selectedFinding?.probable_case_name || "-"}</span>
+                </p>
+                <p>
+                  <span className="text-slate-400">Override:</span>{" "}
+                  <span className="text-slate-100">
+                    {selectedOverride
+                      ? `${selectedOverride.chosen_case_name || selectedOverride.chosen_url || "selected"}`
+                      : "-"}
+                  </span>
                 </p>
                 <p>
                   <span className="text-slate-400">Evidence:</span>{" "}
@@ -1225,6 +1486,16 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                               {candidate.url}
                             </a>
                           ) : null}
+                          <div className="mt-2">
+                            <button
+                              type="button"
+                              onClick={() => void onSelectCandidate(selectedFinding, candidate)}
+                              disabled={overrideSavingCitationId === selectedFinding.citation_id}
+                              className="rounded-md border border-blue-700 bg-blue-900/40 px-2 py-1 text-xs text-blue-100 hover:bg-blue-800/50 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {overrideSavingCitationId === selectedFinding.citation_id ? "Saving..." : "Select this"}
+                            </button>
+                          </div>
                         </li>
                       ))}
                     </ul>

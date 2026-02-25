@@ -89,6 +89,7 @@ class ExtractedCitations(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     doc_id: str = Field(index=True, unique=True)
     citations_json: str = Field(sa_column=Column(Text, nullable=False))
+    citation_ids_json: str = Field(sa_column=Column(Text, nullable=False))
     evidence_json: str = Field(sa_column=Column(Text, nullable=False))
     probable_case_name_json: str = Field(sa_column=Column(Text, nullable=False))
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -104,3 +105,15 @@ class VerificationJob(SQLModel, table=True):
     input_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     error_text: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
     result_id: int | None = Field(default=None, index=True)
+
+
+class CitationOverride(SQLModel, table=True):
+    id: int | None = Field(default=None, primary_key=True)
+    doc_id: str = Field(index=True)
+    citation_id: str = Field(index=True)
+    chosen_url: str | None = Field(default=None, sa_column=Column(Text, nullable=True))
+    chosen_case_name: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+    chosen_year: int | None = Field(default=None)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))

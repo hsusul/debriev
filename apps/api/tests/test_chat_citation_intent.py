@@ -54,6 +54,7 @@ def test_chat_citation_intent_calls_verification_helper(tmp_path) -> None:
         verification = VerifyCitationsResponse(
             findings=[
                 CitationVerificationFinding(
+                    citation_id="cit_61de58f57e9be2f3",
                     citation="410 U.S. 113",
                     status="not_found",
                     confidence=0.0,

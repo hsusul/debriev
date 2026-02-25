@@ -46,6 +46,7 @@ except (
 from app.courtlistener import CourtListenerClient, CourtListenerError
 from app.db import (
     Citation,
+    CitationOverride,
     CitationVerification,
     Document,
     Project,
@@ -338,6 +339,7 @@ class BestMatch(BaseModel):
 
 
 class CitationVerificationFinding(BaseModel):
+    citation_id: str
     citation: str
     status: str
     confidence: float
@@ -383,6 +385,7 @@ class VerifyExtractedCitationsRequest(BaseModel):
 
 class ExtractedCitationsResponse(BaseModel):
     citations: list[str] = Field(default_factory=list)
+    citation_ids: dict[str, str] = Field(default_factory=dict)
     evidence: dict[str, str] = Field(default_factory=dict)
     probable_case_name: dict[str, str | None] = Field(default_factory=dict)
 
@@ -395,12 +398,73 @@ class RiskTotals(BaseModel):
 
 
 class RiskItem(BaseModel):
+    citation_id: str
     citation: str
     status: str
     bogus_reason: str | None = None
     evidence: str
     probable_case_name: str | None = None
     link: str | None = None
+
+
+class CitationOverrideCandidate(BaseModel):
+    url: str | None = None
+    case_name: str | None = None
+    year: int | None = None
+
+
+class CitationOverrideRequest(BaseModel):
+    citation_id: str
+    chosen_candidate: CitationOverrideCandidate
+
+
+class CitationOverrideResponse(BaseModel):
+    id: int
+    doc_id: str
+    citation_id: str
+    chosen_url: str | None = None
+    chosen_case_name: str | None = None
+    chosen_year: int | None = None
+    created_at: datetime
+
+
+class VerificationDiffStatusChange(BaseModel):
+    citation_id: str
+    citation: str
+    left_status: str
+    right_status: str
+
+
+class VerificationDiffBestMatchChange(BaseModel):
+    citation_id: str
+    citation: str
+    left_best_match: BestMatch | None = None
+    right_best_match: BestMatch | None = None
+
+
+class VerificationDiffSummary(BaseModel):
+    left_total: int
+    right_total: int
+    delta_verified: int
+    delta_not_found: int
+    delta_ambiguous: int
+
+
+class VerificationDiffResponse(BaseModel):
+    left_id: int
+    right_id: int
+    summary_changes: VerificationDiffSummary
+    status_changes: list[VerificationDiffStatusChange] = Field(default_factory=list)
+    best_match_changes: list[VerificationDiffBestMatchChange] = Field(
+        default_factory=list
+    )
+
+
+class VerificationInputResponse(BaseModel):
+    doc_id: UUID
+    text: str
+    citations: list[str] = Field(default_factory=list)
+    citation_ids: dict[str, str] = Field(default_factory=dict)
 
 
 class RiskReport(BaseModel):
@@ -1025,6 +1089,7 @@ def _run_citation_verification_for_citations(
     batch_size: int = 25,
     evidence_by_citation: dict[str, str] | None = None,
     probable_case_name_by_citation: dict[str, str | None] | None = None,
+    citation_ids_by_citation: dict[str, str] | None = None,
 ) -> VerifyCitationsResponse:
     _increment_metric("verify_requests_total")
     normalized_citations = _normalize_citation_list(citations)
@@ -1055,6 +1120,20 @@ def _run_citation_verification_for_citations(
         if key not in normalized_case_names:
             normalized_case_names[key] = None
 
+    normalized_citation_ids: dict[str, str] = {}
+    if citation_ids_by_citation is not None:
+        for raw_citation, citation_id in citation_ids_by_citation.items():
+            key = _normalize_citation_string(raw_citation)
+            if not key:
+                continue
+            cleaned_id = _normalize_ws(citation_id)
+            if cleaned_id:
+                normalized_citation_ids[key] = cleaned_id
+    for citation in normalized_citations:
+        key = _normalize_citation_string(citation)
+        if key not in normalized_citation_ids:
+            normalized_citation_ids[key] = _citation_id_for(citation)
+
     input_hash = _citation_list_hash(normalized_citations)
     cached = session.exec(
         select(CitationVerification).where(
@@ -1072,6 +1151,7 @@ def _run_citation_verification_for_citations(
             requested_citations=normalized_citations,
             evidence_by_citation=normalized_evidence,
             probable_case_name_by_citation=normalized_case_names,
+            citation_ids_by_citation=normalized_citation_ids,
         )
         return VerifyCitationsResponse(
             findings=findings,
@@ -1100,6 +1180,7 @@ def _run_citation_verification_for_citations(
         requested_citations=normalized_citations,
         evidence_by_citation=normalized_evidence,
         probable_case_name_by_citation=normalized_case_names,
+        citation_ids_by_citation=normalized_citation_ids,
     )
     summary = _summarize_citation_findings(findings)
     if summary.total == 0 or summary.not_found == summary.total:
@@ -1149,12 +1230,14 @@ def _persist_verification_response(
 def _normalize_extracted_payload(
     *,
     citations: list[str],
+    citation_ids_map: dict[str, str],
     evidence_map: dict[str, str],
     probable_case_name_map: dict[str, str | None],
-) -> tuple[list[str], dict[str, str], dict[str, str | None]]:
+) -> tuple[list[str], dict[str, str], dict[str, str | None], dict[str, str]]:
     normalized_citations = _normalize_citation_list(citations)
     normalized_evidence: dict[str, str] = {}
     normalized_case_names: dict[str, str | None] = {}
+    normalized_citation_ids: dict[str, str] = {}
 
     evidence_by_key = {
         _normalize_citation_string(key): _normalize_ws(value) if value else ""
@@ -1166,13 +1249,26 @@ def _normalize_extracted_payload(
         for key, value in probable_case_name_map.items()
         if _normalize_citation_string(key)
     }
+    citation_id_by_key = {
+        _normalize_citation_string(key): _normalize_ws(value)
+        for key, value in citation_ids_map.items()
+        if _normalize_citation_string(key) and _normalize_ws(value)
+    }
 
     for citation in normalized_citations:
         key = _normalize_citation_string(citation)
         normalized_evidence[citation] = evidence_by_key.get(key, "")
         normalized_case_names[citation] = case_name_by_key.get(key)
+        normalized_citation_ids[citation] = citation_id_by_key.get(
+            key, _citation_id_for(citation)
+        )
 
-    return normalized_citations, normalized_evidence, normalized_case_names
+    return (
+        normalized_citations,
+        normalized_evidence,
+        normalized_case_names,
+        normalized_citation_ids,
+    )
 
 
 def _store_extracted_citations_for_doc(
@@ -1180,12 +1276,14 @@ def _store_extracted_citations_for_doc(
     session: Session,
     doc_id: str,
     citations: list[str],
+    citation_ids_map: dict[str, str],
     evidence_map: dict[str, str],
     probable_case_name_map: dict[str, str | None],
 ) -> ExtractedCitationsResponse:
-    normalized_citations, normalized_evidence, normalized_case_names = (
+    normalized_citations, normalized_evidence, normalized_case_names, normalized_ids = (
         _normalize_extracted_payload(
             citations=citations,
+            citation_ids_map=citation_ids_map,
             evidence_map=evidence_map,
             probable_case_name_map=probable_case_name_map,
         )
@@ -1194,11 +1292,13 @@ def _store_extracted_citations_for_doc(
         session,
         doc_id=doc_id,
         citations=normalized_citations,
+        citation_ids_map=normalized_ids,
         evidence_map=normalized_evidence,
         probable_case_name_map=normalized_case_names,
     )
     return ExtractedCitationsResponse(
         citations=normalized_citations,
+        citation_ids=normalized_ids,
         evidence=normalized_evidence,
         probable_case_name=normalized_case_names,
     )
@@ -1213,6 +1313,7 @@ def _get_persisted_extracted_citations(
 
     try:
         citations_raw = json.loads(stored.citations_json)
+        citation_ids_raw = json.loads(stored.citation_ids_json)
         evidence_raw = json.loads(stored.evidence_json)
         probable_raw = json.loads(stored.probable_case_name_json)
     except json.JSONDecodeError:
@@ -1220,6 +1321,11 @@ def _get_persisted_extracted_citations(
 
     citations = (
         [str(item) for item in citations_raw] if isinstance(citations_raw, list) else []
+    )
+    citation_ids_map = (
+        {str(key): _normalize_ws(str(value)) for key, value in citation_ids_raw.items()}
+        if isinstance(citation_ids_raw, dict)
+        else {}
     )
     evidence_map = (
         {
@@ -1238,15 +1344,17 @@ def _get_persisted_extracted_citations(
         else {}
     )
 
-    normalized_citations, normalized_evidence, normalized_case_names = (
+    normalized_citations, normalized_evidence, normalized_case_names, normalized_ids = (
         _normalize_extracted_payload(
             citations=citations,
+            citation_ids_map=citation_ids_map,
             evidence_map=evidence_map,
             probable_case_name_map=probable_map,
         )
     )
     return ExtractedCitationsResponse(
         citations=normalized_citations,
+        citation_ids=normalized_ids,
         evidence=normalized_evidence,
         probable_case_name=normalized_case_names,
     )
@@ -1261,11 +1369,13 @@ def _run_extracted_verification(
     include_raw: bool,
 ) -> VerifyCitationsResponse:
     citations = _extract_citations(text)
+    citation_ids_map = {citation: _citation_id_for(citation) for citation in citations}
     evidence_by_citation = _extract_citation_evidence(text, citations)
     probable_case_name_by_citation = _extract_case_name_by_citation(text, citations)
 
     extraction_payload = _normalize_extracted_payload(
         citations=citations,
+        citation_ids_map=citation_ids_map,
         evidence_map=evidence_by_citation,
         probable_case_name_map=probable_case_name_by_citation,
     )
@@ -1275,6 +1385,7 @@ def _run_extracted_verification(
             session=session,
             doc_id=normalized_doc_id,
             citations=extraction_payload[0],
+            citation_ids_map=extraction_payload[3],
             evidence_map=extraction_payload[1],
             probable_case_name_map=extraction_payload[2],
         )
@@ -1283,16 +1394,23 @@ def _run_extracted_verification(
         )
         if persisted is not None:
             citations = persisted.citations
+            citation_ids_map = persisted.citation_ids
             evidence_by_citation = persisted.evidence
             probable_case_name_by_citation = persisted.probable_case_name
         else:
-            citations, evidence_by_citation, probable_case_name_by_citation = (
-                extraction_payload
-            )
+            (
+                citations,
+                evidence_by_citation,
+                probable_case_name_by_citation,
+                citation_ids_map,
+            ) = extraction_payload
     else:
-        citations, evidence_by_citation, probable_case_name_by_citation = (
-            extraction_payload
-        )
+        (
+            citations,
+            evidence_by_citation,
+            probable_case_name_by_citation,
+            citation_ids_map,
+        ) = extraction_payload
 
     response = _run_citation_verification_for_citations(
         citations=citations,
@@ -1302,6 +1420,7 @@ def _run_extracted_verification(
         chunk_id=chunk_id,
         evidence_by_citation=evidence_by_citation,
         probable_case_name_by_citation=probable_case_name_by_citation,
+        citation_ids_by_citation=citation_ids_map,
     )
     if normalized_doc_id:
         _persist_verification_response(
@@ -1341,6 +1460,61 @@ def _build_doc_verification_text(*, session: Session, doc_id: UUID) -> str:
     )
 
 
+def _ensure_extracted_citations_for_doc(
+    *,
+    session: Session,
+    doc_id: UUID,
+) -> ExtractedCitationsResponse:
+    doc_id_str = str(doc_id)
+    persisted = _get_persisted_extracted_citations(session=session, doc_id=doc_id_str)
+    if persisted is not None:
+        return persisted
+
+    source_text = _build_doc_verification_text(session=session, doc_id=doc_id)
+    citations = _extract_citations(source_text)
+    citation_ids_map = {citation: _citation_id_for(citation) for citation in citations}
+    evidence_map = _extract_citation_evidence(source_text, citations)
+    probable_case_name_map = _extract_case_name_by_citation(source_text, citations)
+    return _store_extracted_citations_for_doc(
+        session=session,
+        doc_id=doc_id_str,
+        citations=citations,
+        citation_ids_map=citation_ids_map,
+        evidence_map=evidence_map,
+        probable_case_name_map=probable_case_name_map,
+    )
+
+
+def _canonical_verification_input_text(
+    extracted: ExtractedCitationsResponse,
+) -> str:
+    lines: list[str] = []
+    for citation in extracted.citations:
+        lines.append(citation)
+        evidence = _normalize_ws(extracted.evidence.get(citation, ""))
+        if evidence:
+            lines.append(f"Evidence: {evidence}")
+        probable_case_name = extracted.probable_case_name.get(citation)
+        if probable_case_name:
+            lines.append(f"Probable case name: {_normalize_ws(probable_case_name)}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _get_verification_input_payload(
+    *,
+    session: Session,
+    doc_id: UUID,
+) -> VerificationInputResponse:
+    extracted = _ensure_extracted_citations_for_doc(session=session, doc_id=doc_id)
+    return VerificationInputResponse(
+        doc_id=doc_id,
+        text=_canonical_verification_input_text(extracted),
+        citations=extracted.citations,
+        citation_ids=extracted.citation_ids,
+    )
+
+
 def _execute_verification_job(job_id: str, text: str | None, session: Session) -> None:
     job = session.exec(
         select(VerificationJob).where(VerificationJob.id == job_id)
@@ -1367,7 +1541,7 @@ def _execute_verification_job(job_id: str, text: str | None, session: Session) -
         verification_text = (
             _normalize_ws(job_text or "")
             if job_text is not None and _normalize_ws(job_text)
-            else _build_doc_verification_text(session=session, doc_id=doc_uuid)
+            else _get_verification_input_payload(session=session, doc_id=doc_uuid).text
         )
         _run_extracted_verification(
             session=session,
@@ -1433,6 +1607,20 @@ def get_report_citations(
     return stored
 
 
+@app.get(
+    "/reports/{doc_id}/verification-input",
+    response_model=VerificationInputResponse,
+)
+def get_report_verification_input(
+    doc_id: UUID,
+    session: Session = Depends(get_session),
+) -> VerificationInputResponse:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return _get_verification_input_payload(session=session, doc_id=doc_id)
+
+
 def _verification_response_from_result(
     stored: VerificationResult,
 ) -> VerifyCitationsResponse:
@@ -1453,8 +1641,17 @@ def _verification_response_from_result(
     if isinstance(findings_raw, list):
         for item in findings_raw:
             if isinstance(item, dict):
+                if not item.get("citation_id"):
+                    item["citation_id"] = _citation_id_for(
+                        str(item.get("citation") or "")
+                    )
                 findings.append(CitationVerificationFinding.model_validate(item))
-    findings.sort(key=lambda item: _normalize_citation_string(item.citation))
+    findings.sort(
+        key=lambda item: (
+            _normalize_ws(item.citation_id),
+            _normalize_citation_string(item.citation),
+        )
+    )
     summary = CitationVerificationSummary.model_validate(
         summary_raw if isinstance(summary_raw, dict) else {}
     )
@@ -1495,6 +1692,91 @@ def _build_verification_history_items(
     return history
 
 
+def _citation_override_response(row: CitationOverride) -> CitationOverrideResponse:
+    return CitationOverrideResponse(
+        id=int(row.id or 0),
+        doc_id=row.doc_id,
+        citation_id=row.citation_id,
+        chosen_url=row.chosen_url,
+        chosen_case_name=row.chosen_case_name,
+        chosen_year=row.chosen_year,
+        created_at=row.created_at,
+    )
+
+
+def _list_citation_overrides(
+    *,
+    session: Session,
+    doc_id: str,
+) -> list[CitationOverride]:
+    rows = session.exec(
+        select(CitationOverride)
+        .where(CitationOverride.doc_id == doc_id)
+        .order_by(CitationOverride.citation_id.asc(), CitationOverride.id.desc())
+    ).all()
+    latest_by_citation_id: dict[str, CitationOverride] = {}
+    for row in rows:
+        if row.citation_id in latest_by_citation_id:
+            continue
+        latest_by_citation_id[row.citation_id] = row
+    return [latest_by_citation_id[key] for key in sorted(latest_by_citation_id)]
+
+
+def _apply_overrides_to_verification(
+    *,
+    session: Session,
+    doc_id: str,
+    verification: VerifyCitationsResponse,
+) -> VerifyCitationsResponse:
+    overrides = {
+        row.citation_id: row
+        for row in _list_citation_overrides(session=session, doc_id=doc_id)
+    }
+    if not overrides:
+        return verification
+
+    adjusted_findings: list[CitationVerificationFinding] = []
+    for finding in verification.findings:
+        override = overrides.get(finding.citation_id)
+        if override is not None and finding.status == "ambiguous":
+            existing_best = finding.best_match
+            adjusted_findings.append(
+                finding.model_copy(
+                    update={
+                        "status": "verified",
+                        "confidence": 1.0,
+                        "best_match": BestMatch(
+                            case_name=override.chosen_case_name
+                            or (existing_best.case_name if existing_best else None),
+                            court=existing_best.court if existing_best else None,
+                            year=override.chosen_year
+                            if override.chosen_year is not None
+                            else (existing_best.year if existing_best else None),
+                            url=override.chosen_url
+                            or (existing_best.url if existing_best else None),
+                            matched_citation=finding.citation,
+                        ),
+                        "explanation": "Manually overridden by reviewer.",
+                    }
+                )
+            )
+        else:
+            adjusted_findings.append(finding)
+
+    adjusted_findings.sort(
+        key=lambda item: (
+            _normalize_ws(item.citation_id),
+            _normalize_citation_string(item.citation),
+        )
+    )
+    return VerifyCitationsResponse(
+        findings=adjusted_findings,
+        summary=_summarize_citation_findings(adjusted_findings),
+        citations=sorted(verification.citations, key=_normalize_citation_string),
+        raw=verification.raw,
+    )
+
+
 @app.get("/reports/{doc_id}/verification", response_model=VerifyCitationsResponse)
 def get_report_verification(
     doc_id: UUID, session: Session = Depends(get_session)
@@ -1502,7 +1784,11 @@ def get_report_verification(
     stored = get_latest_verification_result(session, doc_id=str(doc_id))
     if stored is None:
         raise HTTPException(status_code=404, detail="Verification result not found")
-    return _verification_response_from_result(stored)
+    return _apply_overrides_to_verification(
+        session=session,
+        doc_id=str(doc_id),
+        verification=_verification_response_from_result(stored),
+    )
 
 
 @app.get(
@@ -1516,7 +1802,7 @@ def get_report_verification_history(
 
 
 @app.get(
-    "/reports/{doc_id}/verification/{result_id}",
+    "/reports/{doc_id}/verification/{result_id:int}",
     response_model=VerifyCitationsResponse,
 )
 def get_report_verification_by_id(
@@ -1529,7 +1815,174 @@ def get_report_verification_by_id(
     ).first()
     if stored is None or stored.doc_id != str(doc_id):
         raise HTTPException(status_code=404, detail="Verification result not found")
-    return _verification_response_from_result(stored)
+    return _apply_overrides_to_verification(
+        session=session,
+        doc_id=str(doc_id),
+        verification=_verification_response_from_result(stored),
+    )
+
+
+@app.post(
+    "/reports/{doc_id}/overrides",
+    response_model=CitationOverrideResponse,
+)
+def create_report_override(
+    doc_id: UUID,
+    payload: CitationOverrideRequest,
+    session: Session = Depends(get_session),
+) -> CitationOverrideResponse:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    citation_id = _normalize_ws(payload.citation_id)
+    if not citation_id:
+        raise HTTPException(status_code=400, detail="citation_id is required")
+
+    chosen_url = _normalize_courtlistener_url(payload.chosen_candidate.url)
+    chosen_case_name = (
+        _normalize_ws(payload.chosen_candidate.case_name)
+        if payload.chosen_candidate.case_name
+        else None
+    )
+    chosen_year = payload.chosen_candidate.year
+
+    doc_id_str = str(doc_id)
+    existing = session.exec(
+        select(CitationOverride)
+        .where(CitationOverride.doc_id == doc_id_str)
+        .where(CitationOverride.citation_id == citation_id)
+        .order_by(CitationOverride.id.desc())
+    ).first()
+
+    if existing is None:
+        row = CitationOverride(
+            doc_id=doc_id_str,
+            citation_id=citation_id,
+            chosen_url=chosen_url,
+            chosen_case_name=chosen_case_name,
+            chosen_year=chosen_year,
+        )
+    else:
+        existing.chosen_url = chosen_url
+        existing.chosen_case_name = chosen_case_name
+        existing.chosen_year = chosen_year
+        row = existing
+
+    session.add(row)
+    session.commit()
+    session.refresh(row)
+    return _citation_override_response(row)
+
+
+@app.get("/reports/{doc_id}/overrides", response_model=list[CitationOverrideResponse])
+def get_report_overrides(
+    doc_id: UUID,
+    session: Session = Depends(get_session),
+) -> list[CitationOverrideResponse]:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    rows = _list_citation_overrides(session=session, doc_id=str(doc_id))
+    return [_citation_override_response(row) for row in rows]
+
+
+@app.get(
+    "/reports/{doc_id}/verification/diff",
+    response_model=VerificationDiffResponse,
+)
+def get_report_verification_diff(
+    doc_id: UUID,
+    left_id: int,
+    right_id: int,
+    session: Session = Depends(get_session),
+) -> VerificationDiffResponse:
+    left_row = session.exec(
+        select(VerificationResult).where(VerificationResult.id == left_id)
+    ).first()
+    right_row = session.exec(
+        select(VerificationResult).where(VerificationResult.id == right_id)
+    ).first()
+    if (
+        left_row is None
+        or right_row is None
+        or left_row.doc_id != str(doc_id)
+        or right_row.doc_id != str(doc_id)
+    ):
+        raise HTTPException(status_code=404, detail="Verification result not found")
+
+    left = _apply_overrides_to_verification(
+        session=session,
+        doc_id=str(doc_id),
+        verification=_verification_response_from_result(left_row),
+    )
+    right = _apply_overrides_to_verification(
+        session=session,
+        doc_id=str(doc_id),
+        verification=_verification_response_from_result(right_row),
+    )
+
+    left_by_id = {finding.citation_id: finding for finding in left.findings}
+    right_by_id = {finding.citation_id: finding for finding in right.findings}
+    citation_ids = sorted(set(left_by_id) | set(right_by_id))
+
+    status_changes: list[VerificationDiffStatusChange] = []
+    best_match_changes: list[VerificationDiffBestMatchChange] = []
+    for citation_id in citation_ids:
+        left_finding = left_by_id.get(citation_id)
+        right_finding = right_by_id.get(citation_id)
+        left_status = left_finding.status if left_finding is not None else "missing"
+        right_status = right_finding.status if right_finding is not None else "missing"
+        citation = (
+            right_finding.citation
+            if right_finding is not None
+            else (left_finding.citation if left_finding is not None else citation_id)
+        )
+
+        if left_status != right_status:
+            status_changes.append(
+                VerificationDiffStatusChange(
+                    citation_id=citation_id,
+                    citation=citation,
+                    left_status=left_status,
+                    right_status=right_status,
+                )
+            )
+
+        left_match = left_finding.best_match if left_finding is not None else None
+        right_match = right_finding.best_match if right_finding is not None else None
+        left_key = _stable_json_key(left_match.model_dump() if left_match else {})
+        right_key = _stable_json_key(right_match.model_dump() if right_match else {})
+        if left_key != right_key:
+            best_match_changes.append(
+                VerificationDiffBestMatchChange(
+                    citation_id=citation_id,
+                    citation=citation,
+                    left_best_match=left_match,
+                    right_best_match=right_match,
+                )
+            )
+
+    status_changes.sort(
+        key=lambda item: (_normalize_ws(item.citation_id), _normalize_ws(item.citation))
+    )
+    best_match_changes.sort(
+        key=lambda item: (_normalize_ws(item.citation_id), _normalize_ws(item.citation))
+    )
+    return VerificationDiffResponse(
+        left_id=left_id,
+        right_id=right_id,
+        summary_changes=VerificationDiffSummary(
+            left_total=left.summary.total,
+            right_total=right.summary.total,
+            delta_verified=right.summary.verified - left.summary.verified,
+            delta_not_found=right.summary.not_found - left.summary.not_found,
+            delta_ambiguous=right.summary.ambiguous - left.summary.ambiguous,
+        ),
+        status_changes=status_changes,
+        best_match_changes=best_match_changes,
+    )
 
 
 def _get_bogus_findings_for_doc(session: Session, doc_id: UUID) -> list[ChatFinding]:
@@ -1583,6 +2036,7 @@ def _build_risk_report(
             (
                 risk_score,
                 RiskItem(
+                    citation_id=finding.citation_id,
                     citation=finding.citation,
                     status=finding.status,
                     bogus_reason=(
@@ -1605,6 +2059,7 @@ def _build_risk_report(
             (
                 35,
                 RiskItem(
+                    citation_id=_citation_id_for(bogus.case_name),
                     citation=bogus.case_name,
                     status="bogus",
                     bogus_reason=bogus.reason_label,
@@ -1644,7 +2099,11 @@ def get_report_risk(
     stored = get_latest_verification_result(session, doc_id=str(doc_id))
     if stored is None:
         raise HTTPException(status_code=404, detail="Verification result not found")
-    verification = _verification_response_from_result(stored)
+    verification = _apply_overrides_to_verification(
+        session=session,
+        doc_id=str(doc_id),
+        verification=_verification_response_from_result(stored),
+    )
     bogus_findings = _get_bogus_findings_for_doc(session, doc_id)
     return _build_risk_report(verification=verification, bogus_findings=bogus_findings)
 
@@ -1659,7 +2118,11 @@ def get_report_verification_with_risk(
     stored = get_latest_verification_result(session, doc_id=str(doc_id))
     if stored is None:
         raise HTTPException(status_code=404, detail="Verification result not found")
-    verification = _verification_response_from_result(stored)
+    verification = _apply_overrides_to_verification(
+        session=session,
+        doc_id=str(doc_id),
+        verification=_verification_response_from_result(stored),
+    )
     bogus_findings = _get_bogus_findings_for_doc(session, doc_id)
     risk = _build_risk_report(verification=verification, bogus_findings=bogus_findings)
     return VerificationWithRiskResponse(verification=verification, risk=risk)
@@ -1679,7 +2142,11 @@ def get_report_overview(
     )
     stored_verification = get_latest_verification_result(session, doc_id=doc_id_str)
     latest_verification = (
-        _verification_response_from_result(stored_verification)
+        _apply_overrides_to_verification(
+            session=session,
+            doc_id=doc_id_str,
+            verification=_verification_response_from_result(stored_verification),
+        )
         if stored_verification is not None
         else None
     )
@@ -1719,11 +2186,8 @@ def run_report(
         raise HTTPException(status_code=404, detail="Document not found")
 
     doc_id_str = str(doc_id)
-    extracted = _get_persisted_extracted_citations(session=session, doc_id=doc_id_str)
-    if extracted is not None and extracted.citations:
-        text_payload = "\n".join(extracted.citations)
-    else:
-        text_payload = _build_doc_verification_text(session=session, doc_id=doc_id)
+    verification_input = _get_verification_input_payload(session=session, doc_id=doc_id)
+    text_payload = verification_input.text
 
     normalized_payload = _normalize_ws(text_payload)
     existing_job = session.exec(
@@ -1858,9 +2322,11 @@ def create_verification_job(
     if document is None:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    text_payload = (
-        payload.text.strip() if payload.text and payload.text.strip() else None
-    )
+    text_payload = payload.text.strip() if payload.text and payload.text.strip() else ""
+    if not text_payload:
+        text_payload = _get_verification_input_payload(
+            session=session, doc_id=doc_id
+        ).text
     job = VerificationJob(doc_id=str(doc_id), status="queued", input_text=text_payload)
     session.add(job)
     session.commit()
@@ -3189,6 +3655,12 @@ def _normalize_citation_string(value: str) -> str:
     return _normalize_ws(lowered).strip(" .")
 
 
+def _citation_id_for(citation: str) -> str:
+    key = _normalize_citation_string(citation)
+    digest = sha256(key.encode("utf-8")).hexdigest()
+    return f"cit_{digest[:16]}"
+
+
 def _optional_text(data: dict[str, Any], keys: tuple[str, ...]) -> str | None:
     for key in keys:
         value = data.get(key)
@@ -3310,6 +3782,7 @@ def _courtlistener_raw_to_findings(
     requested_citations: list[str] | None = None,
     evidence_by_citation: dict[str, str] | None = None,
     probable_case_name_by_citation: dict[str, str | None] | None = None,
+    citation_ids_by_citation: dict[str, str] | None = None,
 ) -> list[CitationVerificationFinding]:
     candidate_limit = 5
     by_citation: dict[str, dict[str, Any]] = {}
@@ -3398,6 +3871,12 @@ def _courtlistener_raw_to_findings(
 
         findings.append(
             CitationVerificationFinding(
+                citation_id=(
+                    citation_ids_by_citation.get(citation_key)
+                    if citation_ids_by_citation is not None
+                    else _citation_id_for(citation)
+                )
+                or _citation_id_for(citation),
                 citation=citation,
                 status=status,
                 confidence=confidence,
@@ -3669,6 +4148,11 @@ def chat(
                 doc_id=str(payload.doc_id),
                 evidence_by_citation=evidence_by_citation,
                 probable_case_name_by_citation=probable_case_name_by_citation,
+            )
+            verification_response = _apply_overrides_to_verification(
+                session=session,
+                doc_id=str(payload.doc_id),
+                verification=verification_response,
             )
             answer = _citation_verification_answer(verification_response)
             tool_result = _build_citation_tool_result(verification_response)

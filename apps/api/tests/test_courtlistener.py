@@ -26,6 +26,7 @@ from app.db import (
 )
 from app.main import (
     ChatFinding,
+    CitationOverrideRequest,
     VerificationJobCreateRequest,
     VerifyCitationsRequest,
     VerifyExtractedCitationsRequest,
@@ -39,11 +40,15 @@ from app.main import (
     _run_citation_verification_for_citations,
     _courtlistener_raw_to_findings,
     _execute_verification_job,
+    create_report_override,
     create_verification_job,
     export_report_pdf,
     get_report_citations,
     get_report_overview,
+    get_report_overrides,
     get_report_risk,
+    get_report_verification_diff,
+    get_report_verification_input,
     get_report_verification_by_id,
     get_report_verification_history,
     get_verification_job_status,
@@ -1289,3 +1294,165 @@ def test_report_overview_returns_partial_data_gracefully(tmp_path: Path) -> None
     assert overview["risk_report"] is None
     assert overview["bogus_findings"] == []
     assert overview["verification_history"] == []
+
+
+def test_extracted_verification_returns_stable_citation_ids(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973).",
+        doc_id=doc_id,
+    )
+    with _make_session(tmp_path) as session:
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            return_value={
+                "results": [
+                    {
+                        "citation": "410 U.S. 113",
+                        "results": [{"citation": "410 U.S. 113"}],
+                    }
+                ]
+            },
+        ):
+            verification = verify_citations_extracted(
+                payload, session=session
+            ).model_dump()
+        extracted = get_report_citations(
+            doc_id=UUID(doc_id), session=session
+        ).model_dump()
+
+    assert verification["findings"][0]["citation_id"].startswith("cit_")
+    assert (
+        extracted["citation_ids"]["410 U.S. 113"]
+        == verification["findings"][0]["citation_id"]
+    )
+
+
+def test_report_verification_input_uses_canonical_backend_text(tmp_path: Path) -> None:
+    with _make_session(tmp_path) as session:
+        doc_id = _insert_document_with_report(session)
+        payload = get_report_verification_input(doc_id=UUID(doc_id), session=session)
+
+    assert payload.doc_id == UUID(doc_id)
+    assert "410 U.S. 113" in payload.text
+    assert "Evidence:" in payload.text
+    assert payload.citations == ["410 U.S. 113"]
+    assert payload.citation_ids["410 U.S. 113"].startswith("cit_")
+
+
+def test_overrides_promote_ambiguous_to_verified(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973).",
+        doc_id=doc_id,
+    )
+    ambiguous_raw = {
+        "results": [
+            {
+                "citation": "410 U.S. 113",
+                "results": [
+                    {
+                        "citation": "410 U.S. 113",
+                        "case_name": "Case Alpha",
+                        "url": "/opinion/1/case-alpha/",
+                    },
+                    {
+                        "citation": "410 U.S. 113",
+                        "case_name": "Case Beta",
+                        "url": "/opinion/2/case-beta/",
+                    },
+                ],
+            }
+        ]
+    }
+
+    with _make_session(tmp_path) as session:
+        session.add(
+            Document(
+                doc_id=UUID(doc_id),
+                filename="fixture.pdf",
+                file_path="/tmp/fixture.pdf",
+                stub_text="Roe v. Wade, 410 U.S. 113 (1973).",
+            )
+        )
+        session.commit()
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            return_value=ambiguous_raw,
+        ):
+            verify_citations_extracted(payload, session=session)
+
+        before = get_report_verification(doc_id=UUID(doc_id), session=session)
+        assert before.findings[0].status == "ambiguous"
+
+        create_report_override(
+            doc_id=UUID(doc_id),
+            payload=CitationOverrideRequest(
+                citation_id=before.findings[0].citation_id,
+                chosen_candidate={
+                    "url": "https://www.courtlistener.com/opinion/108713/roe-v-wade/",
+                    "case_name": "Roe v. Wade",
+                    "year": 1973,
+                },
+            ),
+            session=session,
+        )
+        overrides = get_report_overrides(doc_id=UUID(doc_id), session=session)
+        after = get_report_verification(doc_id=UUID(doc_id), session=session)
+
+    assert len(overrides) == 1
+    assert overrides[0].citation_id == before.findings[0].citation_id
+    assert after.findings[0].status == "verified"
+    assert after.findings[0].best_match is not None
+    assert after.findings[0].best_match.case_name == "Roe v. Wade"
+
+
+def test_verification_diff_reports_status_and_match_changes(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    first_payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973).",
+        doc_id=doc_id,
+    )
+    second_payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973). Brown v. Board, 347 U.S. 483 (1954).",
+        doc_id=doc_id,
+    )
+    with _make_session(tmp_path) as session:
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            side_effect=[
+                {"results": [{"citation": "410 U.S. 113", "results": []}]},
+                {
+                    "results": [
+                        {
+                            "citation": "347 U.S. 483",
+                            "results": [],
+                        },
+                        {
+                            "citation": "410 U.S. 113",
+                            "results": [
+                                {"citation": "410 U.S. 113", "case_name": "Roe v. Wade"}
+                            ],
+                        },
+                    ]
+                },
+            ],
+        ):
+            verify_citations_extracted(first_payload, session=session)
+            verify_citations_extracted(second_payload, session=session)
+
+        history = get_report_verification_history(doc_id=UUID(doc_id), session=session)
+        diff = get_report_verification_diff(
+            doc_id=UUID(doc_id),
+            left_id=history[1].id,
+            right_id=history[0].id,
+            session=session,
+        ).model_dump()
+
+    assert diff["summary_changes"]["delta_verified"] == 1
+    assert any(
+        change["citation"] == "410 U.S. 113" for change in diff["status_changes"]
+    )
+    assert any(
+        change["citation"] == "410 U.S. 113" for change in diff["best_match_changes"]
+    )

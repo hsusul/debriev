@@ -17,6 +17,7 @@ except (
 
 from .models import (
     Citation,
+    CitationOverride,
     CitationVerification,
     Document,
     ExtractedCitations,
@@ -86,6 +87,7 @@ def store_extracted_citations(
     *,
     doc_id: str,
     citations: list[str],
+    citation_ids_map: dict[str, str],
     evidence_map: dict[str, str],
     probable_case_name_map: dict[str, str | None],
 ) -> ExtractedCitations:
@@ -95,6 +97,10 @@ def store_extracted_citations(
 
     now = datetime.now(UTC)
     citations_json = json.dumps(citations, sort_keys=True)
+    citation_ids_json = json.dumps(
+        {key: citation_ids_map[key] for key in sorted(citation_ids_map)},
+        sort_keys=True,
+    )
     evidence_json = json.dumps(
         {key: evidence_map[key] for key in sorted(evidence_map)},
         sort_keys=True,
@@ -106,6 +112,7 @@ def store_extracted_citations(
 
     if existing is not None:
         existing.citations_json = citations_json
+        existing.citation_ids_json = citation_ids_json
         existing.evidence_json = evidence_json
         existing.probable_case_name_json = probable_json
         existing.updated_at = now
@@ -117,6 +124,7 @@ def store_extracted_citations(
     created = ExtractedCitations(
         doc_id=doc_id,
         citations_json=citations_json,
+        citation_ids_json=citation_ids_json,
         evidence_json=evidence_json,
         probable_case_name_json=probable_json,
         created_at=now,
@@ -143,6 +151,7 @@ __all__ = [
     "Document",
     "Report",
     "Citation",
+    "CitationOverride",
     "CitationVerification",
     "ExtractedCitations",
     "VerificationJob",
