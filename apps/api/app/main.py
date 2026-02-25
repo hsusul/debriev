@@ -306,6 +306,7 @@ class ChatFinding(BaseModel):
     evidence: str
     doc_id: str | None = None
     chunk_id: str | None = None
+    citation_id: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -348,6 +349,7 @@ class CitationVerificationFinding(BaseModel):
     explanation: str
     evidence: str = ""
     probable_case_name: str | None = None
+    is_overridden: bool = False
 
 
 class CitationVerificationSummary(BaseModel):
@@ -395,6 +397,7 @@ class RiskTotals(BaseModel):
     not_found: int = 0
     ambiguous: int = 0
     bogus: int = 0
+    overridden: int = 0
 
 
 class RiskItem(BaseModel):
@@ -426,6 +429,7 @@ class CitationOverrideResponse(BaseModel):
     chosen_case_name: str | None = None
     chosen_year: int | None = None
     created_at: datetime
+    updated_at: datetime
 
 
 class VerificationDiffStatusChange(BaseModel):
@@ -440,6 +444,20 @@ class VerificationDiffBestMatchChange(BaseModel):
     citation: str
     left_best_match: BestMatch | None = None
     right_best_match: BestMatch | None = None
+
+
+class VerificationDiffCitationChange(BaseModel):
+    citation_id: str
+    citation: str
+    old_status: str
+    new_status: str
+    old_best_match: BestMatch | None = None
+    new_best_match: BestMatch | None = None
+    old_confidence: float | None = None
+    new_confidence: float | None = None
+    old_is_overridden: bool = False
+    new_is_overridden: bool = False
+    changed_due_to_override: bool = False
 
 
 class VerificationDiffSummary(BaseModel):
@@ -458,10 +476,12 @@ class VerificationDiffResponse(BaseModel):
     best_match_changes: list[VerificationDiffBestMatchChange] = Field(
         default_factory=list
     )
+    changes: list[VerificationDiffCitationChange] = Field(default_factory=list)
 
 
 class VerificationInputResponse(BaseModel):
     doc_id: UUID
+    version: str
     text: str
     citations: list[str] = Field(default_factory=list)
     citation_ids: dict[str, str] = Field(default_factory=dict)
@@ -491,6 +511,7 @@ class ReportOverviewResponse(BaseModel):
     risk_report: RiskReport | None = None
     bogus_findings: list[ChatFinding] = Field(default_factory=list)
     verification_history: list[VerificationHistoryItem] = Field(default_factory=list)
+    overrides: list[CitationOverrideResponse] = Field(default_factory=list)
     export_endpoints: ReportOverviewExportEndpoints
 
 
@@ -1488,8 +1509,15 @@ def _ensure_extracted_citations_for_doc(
 def _canonical_verification_input_text(
     extracted: ExtractedCitationsResponse,
 ) -> str:
+    ordered_citations = sorted(
+        extracted.citations,
+        key=lambda citation: (
+            _normalize_ws(extracted.citation_ids.get(citation, "")),
+            _normalize_citation_string(citation),
+        ),
+    )
     lines: list[str] = []
-    for citation in extracted.citations:
+    for citation in ordered_citations:
         lines.append(citation)
         evidence = _normalize_ws(extracted.evidence.get(citation, ""))
         if evidence:
@@ -1507,11 +1535,23 @@ def _get_verification_input_payload(
     doc_id: UUID,
 ) -> VerificationInputResponse:
     extracted = _ensure_extracted_citations_for_doc(session=session, doc_id=doc_id)
+    ordered_citations = sorted(
+        extracted.citations,
+        key=lambda citation: (
+            _normalize_ws(extracted.citation_ids.get(citation, "")),
+            _normalize_citation_string(citation),
+        ),
+    )
+    ordered_citation_ids = {
+        citation: extracted.citation_ids.get(citation, _citation_id_for(citation))
+        for citation in ordered_citations
+    }
     return VerificationInputResponse(
         doc_id=doc_id,
+        version="v1",
         text=_canonical_verification_input_text(extracted),
-        citations=extracted.citations,
-        citation_ids=extracted.citation_ids,
+        citations=ordered_citations,
+        citation_ids=ordered_citation_ids,
     )
 
 
@@ -1701,6 +1741,7 @@ def _citation_override_response(row: CitationOverride) -> CitationOverrideRespon
         chosen_case_name=row.chosen_case_name,
         chosen_year=row.chosen_year,
         created_at=row.created_at,
+        updated_at=row.updated_at,
     )
 
 
@@ -1712,7 +1753,11 @@ def _list_citation_overrides(
     rows = session.exec(
         select(CitationOverride)
         .where(CitationOverride.doc_id == doc_id)
-        .order_by(CitationOverride.citation_id.asc(), CitationOverride.id.desc())
+        .order_by(
+            CitationOverride.citation_id.asc(),
+            CitationOverride.updated_at.desc(),
+            CitationOverride.id.desc(),
+        )
     ).all()
     latest_by_citation_id: dict[str, CitationOverride] = {}
     for row in rows:
@@ -1745,6 +1790,7 @@ def _apply_overrides_to_verification(
                     update={
                         "status": "verified",
                         "confidence": 1.0,
+                        "is_overridden": True,
                         "best_match": BestMatch(
                             case_name=override.chosen_case_name
                             or (existing_best.case_name if existing_best else None),
@@ -1772,7 +1818,13 @@ def _apply_overrides_to_verification(
     return VerifyCitationsResponse(
         findings=adjusted_findings,
         summary=_summarize_citation_findings(adjusted_findings),
-        citations=sorted(verification.citations, key=_normalize_citation_string),
+        citations=sorted(
+            verification.citations,
+            key=lambda citation: (
+                _citation_id_for(citation),
+                _normalize_citation_string(citation),
+            ),
+        ),
         raw=verification.raw,
     )
 
@@ -1826,6 +1878,10 @@ def get_report_verification_by_id(
     "/reports/{doc_id}/overrides",
     response_model=CitationOverrideResponse,
 )
+@app.put(
+    "/reports/{doc_id}/overrides",
+    response_model=CitationOverrideResponse,
+)
 def create_report_override(
     doc_id: UUID,
     payload: CitationOverrideRequest,
@@ -1852,21 +1908,25 @@ def create_report_override(
         select(CitationOverride)
         .where(CitationOverride.doc_id == doc_id_str)
         .where(CitationOverride.citation_id == citation_id)
-        .order_by(CitationOverride.id.desc())
+        .order_by(CitationOverride.updated_at.desc(), CitationOverride.id.desc())
     ).first()
 
     if existing is None:
+        now = datetime.now(UTC)
         row = CitationOverride(
             doc_id=doc_id_str,
             citation_id=citation_id,
             chosen_url=chosen_url,
             chosen_case_name=chosen_case_name,
             chosen_year=chosen_year,
+            created_at=now,
+            updated_at=now,
         )
     else:
         existing.chosen_url = chosen_url
         existing.chosen_case_name = chosen_case_name
         existing.chosen_year = chosen_year
+        existing.updated_at = datetime.now(UTC)
         row = existing
 
     session.add(row)
@@ -1888,6 +1948,29 @@ def get_report_overrides(
     return [_citation_override_response(row) for row in rows]
 
 
+@app.delete("/reports/{doc_id}/overrides/{citation_id}")
+def delete_report_override(
+    doc_id: UUID,
+    citation_id: str,
+    session: Session = Depends(get_session),
+) -> dict[str, bool]:
+    document = session.exec(select(Document).where(Document.doc_id == doc_id)).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    normalized_id = _normalize_ws(citation_id)
+    row = session.exec(
+        select(CitationOverride)
+        .where(CitationOverride.doc_id == str(doc_id))
+        .where(CitationOverride.citation_id == normalized_id)
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Override not found")
+    session.delete(row)
+    session.commit()
+    return {"deleted": True}
+
+
 @app.get(
     "/reports/{doc_id}/verification/diff",
     response_model=VerificationDiffResponse,
@@ -1896,6 +1979,7 @@ def get_report_verification_diff(
     doc_id: UUID,
     left_id: int,
     right_id: int,
+    only_changes: bool = True,
     session: Session = Depends(get_session),
 ) -> VerificationDiffResponse:
     left_row = session.exec(
@@ -1929,6 +2013,7 @@ def get_report_verification_diff(
 
     status_changes: list[VerificationDiffStatusChange] = []
     best_match_changes: list[VerificationDiffBestMatchChange] = []
+    changes: list[VerificationDiffCitationChange] = []
     for citation_id in citation_ids:
         left_finding = left_by_id.get(citation_id)
         right_finding = right_by_id.get(citation_id)
@@ -1940,7 +2025,43 @@ def get_report_verification_diff(
             else (left_finding.citation if left_finding is not None else citation_id)
         )
 
-        if left_status != right_status:
+        left_match = left_finding.best_match if left_finding is not None else None
+        right_match = right_finding.best_match if right_finding is not None else None
+        left_key = _stable_json_key(left_match.model_dump() if left_match else {})
+        right_key = _stable_json_key(right_match.model_dump() if right_match else {})
+        left_confidence = left_finding.confidence if left_finding is not None else None
+        right_confidence = (
+            right_finding.confidence if right_finding is not None else None
+        )
+        left_is_overridden = bool(
+            left_finding.is_overridden if left_finding is not None else False
+        )
+        right_is_overridden = bool(
+            right_finding.is_overridden if right_finding is not None else False
+        )
+
+        status_changed = left_status != right_status
+        best_match_changed = left_key != right_key
+        confidence_changed = left_confidence != right_confidence
+        override_state_changed = left_is_overridden != right_is_overridden
+        changed_due_to_override = (
+            left_is_overridden
+            or right_is_overridden
+            or override_state_changed
+            or (
+                (status_changed or best_match_changed or confidence_changed)
+                and (left_is_overridden or right_is_overridden)
+            )
+        )
+        any_change = (
+            status_changed
+            or best_match_changed
+            or confidence_changed
+            or override_state_changed
+            or changed_due_to_override
+        )
+
+        if status_changed:
             status_changes.append(
                 VerificationDiffStatusChange(
                     citation_id=citation_id,
@@ -1950,11 +2071,7 @@ def get_report_verification_diff(
                 )
             )
 
-        left_match = left_finding.best_match if left_finding is not None else None
-        right_match = right_finding.best_match if right_finding is not None else None
-        left_key = _stable_json_key(left_match.model_dump() if left_match else {})
-        right_key = _stable_json_key(right_match.model_dump() if right_match else {})
-        if left_key != right_key:
+        if best_match_changed:
             best_match_changes.append(
                 VerificationDiffBestMatchChange(
                     citation_id=citation_id,
@@ -1964,10 +2081,30 @@ def get_report_verification_diff(
                 )
             )
 
+        if not only_changes or any_change:
+            changes.append(
+                VerificationDiffCitationChange(
+                    citation_id=citation_id,
+                    citation=citation,
+                    old_status=left_status,
+                    new_status=right_status,
+                    old_best_match=left_match,
+                    new_best_match=right_match,
+                    old_confidence=left_confidence,
+                    new_confidence=right_confidence,
+                    old_is_overridden=left_is_overridden,
+                    new_is_overridden=right_is_overridden,
+                    changed_due_to_override=changed_due_to_override,
+                )
+            )
+
     status_changes.sort(
         key=lambda item: (_normalize_ws(item.citation_id), _normalize_ws(item.citation))
     )
     best_match_changes.sort(
+        key=lambda item: (_normalize_ws(item.citation_id), _normalize_ws(item.citation))
+    )
+    changes.sort(
         key=lambda item: (_normalize_ws(item.citation_id), _normalize_ws(item.citation))
     )
     return VerificationDiffResponse(
@@ -1982,6 +2119,7 @@ def get_report_verification_diff(
         ),
         status_changes=status_changes,
         best_match_changes=best_match_changes,
+        changes=changes,
     )
 
 
@@ -1997,38 +2135,56 @@ def _get_bogus_findings_for_doc(session: Session, doc_id: UUID) -> list[ChatFind
     findings = _extract_bogus_case_findings(
         [{"doc_id": str(doc_id), "chunk_id": f"{doc_id}:stub", "text": source_text}]
     )
-    return _to_chat_findings(findings)
+    chat_findings = _to_chat_findings(findings)
+    extracted = _get_persisted_extracted_citations(session=session, doc_id=str(doc_id))
+    if extracted is None:
+        return chat_findings
+
+    citation_id_by_case_key: dict[str, str] = {}
+    for citation in extracted.citations:
+        citation_id = extracted.citation_ids.get(citation)
+        probable_case = extracted.probable_case_name.get(citation)
+        if citation_id and probable_case:
+            case_key = _case_key(probable_case)
+            if case_key and case_key not in citation_id_by_case_key:
+                citation_id_by_case_key[case_key] = citation_id
+
+    with_ids: list[ChatFinding] = []
+    for finding in chat_findings:
+        citation_id = citation_id_by_case_key.get(_case_key(finding.case_name))
+        with_ids.append(finding.model_copy(update={"citation_id": citation_id}))
+    with_ids.sort(
+        key=lambda item: (
+            _normalize_ws(item.citation_id or ""),
+            _case_key(item.case_name),
+            _normalize_ws(item.evidence),
+        )
+    )
+    return with_ids
 
 
 def _build_risk_report(
     verification: VerifyCitationsResponse,
     bogus_findings: list[ChatFinding],
 ) -> RiskReport:
-    status_weights = {"verified": 0, "ambiguous": 10, "not_found": 25}
+    status_weights = {"verified": 0, "overridden": 0, "ambiguous": 10, "not_found": 25}
     risk_items: list[tuple[int, RiskItem]] = []
-    bogus_by_key = {_case_key(item.case_name): item for item in bogus_findings}
+    bogus_by_citation_id = {
+        _normalize_ws(item.citation_id): item
+        for item in bogus_findings
+        if item.citation_id and _normalize_ws(item.citation_id)
+    }
+    bogus_unmapped = [
+        item
+        for item in bogus_findings
+        if not item.citation_id
+        or _normalize_ws(item.citation_id) not in bogus_by_citation_id
+    ]
 
-    bogus_matches: set[str] = set()
     for finding in verification.findings:
-        citation_key = _case_key(finding.citation)
-        probable_key = _case_key(finding.probable_case_name or "")
-        evidence_key = _case_key(finding.evidence)
-        matched_bogus: ChatFinding | None = None
-        for bogus_key, bogus in bogus_by_key.items():
-            if not bogus_key:
-                continue
-            if (
-                bogus_key in citation_key
-                or bogus_key in probable_key
-                or bogus_key in evidence_key
-                or citation_key in bogus_key
-                or probable_key in bogus_key
-            ):
-                matched_bogus = bogus
-                bogus_matches.add(bogus_key)
-                break
-
-        status_weight = status_weights.get(finding.status, 0)
+        matched_bogus = bogus_by_citation_id.get(_normalize_ws(finding.citation_id))
+        effective_status = "overridden" if finding.is_overridden else finding.status
+        status_weight = status_weights.get(effective_status, 0)
         bogus_weight = 35 if matched_bogus is not None else 0
         risk_score = min(100, status_weight + bogus_weight)
         evidence = matched_bogus.evidence if matched_bogus else finding.evidence
@@ -2038,7 +2194,7 @@ def _build_risk_report(
                 RiskItem(
                     citation_id=finding.citation_id,
                     citation=finding.citation,
-                    status=finding.status,
+                    status=effective_status,
                     bogus_reason=(
                         matched_bogus.reason_label
                         if matched_bogus is not None
@@ -2051,15 +2207,12 @@ def _build_risk_report(
             )
         )
 
-    for bogus in bogus_findings:
-        bogus_key = _case_key(bogus.case_name)
-        if bogus_key in bogus_matches:
-            continue
+    for bogus in bogus_unmapped:
         risk_items.append(
             (
                 35,
                 RiskItem(
-                    citation_id=_citation_id_for(bogus.case_name),
+                    citation_id=bogus.citation_id or _citation_id_for(bogus.case_name),
                     citation=bogus.case_name,
                     status="bogus",
                     bogus_reason=bogus.reason_label,
@@ -2073,17 +2226,27 @@ def _build_risk_report(
     risk_items.sort(
         key=lambda item: (
             -item[0],
+            _normalize_ws(item[1].citation_id),
             _normalize_citation_string(item[1].citation),
             _normalize_ws(item[1].status),
         )
     )
     top_risks = [item for _, item in risk_items]
 
+    overridden_count = sum(
+        1 for finding in verification.findings if finding.is_overridden
+    )
+    verified_count = sum(
+        1
+        for finding in verification.findings
+        if finding.status == "verified" and not finding.is_overridden
+    )
     totals = RiskTotals(
-        verified=verification.summary.verified,
+        verified=verified_count,
         not_found=verification.summary.not_found,
         ambiguous=verification.summary.ambiguous,
         bogus=len(bogus_findings),
+        overridden=overridden_count,
     )
     score = min(
         100,
@@ -2169,6 +2332,10 @@ def get_report_overview(
         verification_history=_build_verification_history_items(
             session=session, doc_id=doc_id_str
         ),
+        overrides=[
+            _citation_override_response(row)
+            for row in _list_citation_overrides(session=session, doc_id=doc_id_str)
+        ],
         export_endpoints=ReportOverviewExportEndpoints(
             pdf_url=f"/reports/{doc_id}/export.pdf",
         ),
@@ -3279,6 +3446,7 @@ class BogusCaseFinding:
     evidence: str
     doc_id: str | None = None
     chunk_id: str | None = None
+    citation_id: str | None = None
 
 
 def _clean_evidence_snippet(evidence: str, max_len: int = 240) -> str:
@@ -3454,6 +3622,7 @@ def _to_chat_findings(findings: list[BogusCaseFinding]) -> list[ChatFinding]:
             evidence=finding.evidence,
             doc_id=finding.doc_id,
             chunk_id=finding.chunk_id,
+            citation_id=finding.citation_id,
         )
         for finding in findings
     ]

@@ -18,6 +18,7 @@ from sqlmodel import SQLModel, Session, create_engine, select
 
 from app.courtlistener import CourtListenerClient, CourtListenerError
 from app.db import (
+    CitationOverride,
     CitationVerification,
     Document,
     Report,
@@ -42,6 +43,7 @@ from app.main import (
     _execute_verification_job,
     create_report_override,
     create_verification_job,
+    delete_report_override,
     export_report_pdf,
     get_report_citations,
     get_report_overview,
@@ -1049,8 +1051,10 @@ def test_get_report_risk_is_deterministic_with_bogus_overlay(tmp_path: Path) -> 
         "not_found": 2,
         "ambiguous": 0,
         "bogus": 1,
+        "overridden": 0,
     }
     assert [item["citation"] for item in first["top_risks"]] == [
+        "Roe v. Wade",
         "347 U.S. 483",
         "410 U.S. 113",
     ]
@@ -1331,13 +1335,16 @@ def test_extracted_verification_returns_stable_citation_ids(tmp_path: Path) -> N
 def test_report_verification_input_uses_canonical_backend_text(tmp_path: Path) -> None:
     with _make_session(tmp_path) as session:
         doc_id = _insert_document_with_report(session)
-        payload = get_report_verification_input(doc_id=UUID(doc_id), session=session)
+        first = get_report_verification_input(doc_id=UUID(doc_id), session=session)
+        second = get_report_verification_input(doc_id=UUID(doc_id), session=session)
 
-    assert payload.doc_id == UUID(doc_id)
-    assert "410 U.S. 113" in payload.text
-    assert "Evidence:" in payload.text
-    assert payload.citations == ["410 U.S. 113"]
-    assert payload.citation_ids["410 U.S. 113"].startswith("cit_")
+    assert first == second
+    assert first.doc_id == UUID(doc_id)
+    assert first.version == "v1"
+    assert "410 U.S. 113" in first.text
+    assert "Evidence:" in first.text
+    assert first.citations == ["410 U.S. 113"]
+    assert first.citation_ids["410 U.S. 113"].startswith("cit_")
 
 
 def test_overrides_promote_ambiguous_to_verified(tmp_path: Path) -> None:
@@ -1403,8 +1410,91 @@ def test_overrides_promote_ambiguous_to_verified(tmp_path: Path) -> None:
     assert len(overrides) == 1
     assert overrides[0].citation_id == before.findings[0].citation_id
     assert after.findings[0].status == "verified"
+    assert after.findings[0].is_overridden is True
     assert after.findings[0].best_match is not None
     assert after.findings[0].best_match.case_name == "Roe v. Wade"
+
+
+def test_override_upsert_and_delete_lifecycle(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    with _make_session(tmp_path) as session:
+        session.add(
+            Document(
+                doc_id=UUID(doc_id),
+                filename="fixture.pdf",
+                file_path="/tmp/fixture.pdf",
+                stub_text="stub",
+            )
+        )
+        session.commit()
+
+        first = create_report_override(
+            doc_id=UUID(doc_id),
+            payload=CitationOverrideRequest(
+                citation_id="cit_test_123",
+                chosen_candidate={
+                    "url": "https://www.courtlistener.com/opinion/1/",
+                    "case_name": "Case One",
+                    "year": 2001,
+                },
+            ),
+            session=session,
+        )
+        second = create_report_override(
+            doc_id=UUID(doc_id),
+            payload=CitationOverrideRequest(
+                citation_id="cit_test_123",
+                chosen_candidate={
+                    "url": "https://www.courtlistener.com/opinion/2/",
+                    "case_name": "Case Two",
+                    "year": 2002,
+                },
+            ),
+            session=session,
+        )
+        rows = get_report_overrides(doc_id=UUID(doc_id), session=session)
+        deleted = delete_report_override(
+            doc_id=UUID(doc_id), citation_id="cit_test_123", session=session
+        )
+        rows_after_delete = get_report_overrides(doc_id=UUID(doc_id), session=session)
+
+    assert first.id == second.id
+    assert second.chosen_case_name == "Case Two"
+    assert len(rows) == 1
+    assert rows[0].chosen_url == "https://www.courtlistener.com/opinion/2/"
+    assert deleted == {"deleted": True}
+    assert rows_after_delete == []
+
+
+def test_override_unique_constraint_on_doc_and_citation(tmp_path: Path) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    with _make_session(tmp_path) as session:
+        session.add(
+            CitationOverride(
+                doc_id="doc-1",
+                citation_id="cit-1",
+                chosen_url="https://example.test/1",
+                chosen_case_name="Case 1",
+                chosen_year=2001,
+            )
+        )
+        session.commit()
+        session.add(
+            CitationOverride(
+                doc_id="doc-1",
+                citation_id="cit-1",
+                chosen_url="https://example.test/2",
+                chosen_case_name="Case 2",
+                chosen_year=2002,
+            )
+        )
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+        else:
+            raise AssertionError("Expected IntegrityError for duplicate override key")
 
 
 def test_verification_diff_reports_status_and_match_changes(tmp_path: Path) -> None:
@@ -1456,3 +1546,103 @@ def test_verification_diff_reports_status_and_match_changes(tmp_path: Path) -> N
     assert any(
         change["citation"] == "410 U.S. 113" for change in diff["best_match_changes"]
     )
+    assert any(
+        change["citation"] == "410 U.S. 113"
+        and change["old_status"] == "not_found"
+        and change["new_status"] == "verified"
+        and change["old_confidence"] == 0.0
+        and change["new_confidence"] == 1.0
+        for change in diff["changes"]
+    )
+
+
+def test_verification_diff_only_changes_false_includes_unchanged(
+    tmp_path: Path,
+) -> None:
+    doc_id = str(uuid4())
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973).",
+        doc_id=doc_id,
+    )
+    with _make_session(tmp_path) as session:
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            return_value={
+                "results": [
+                    {
+                        "citation": "410 U.S. 113",
+                        "results": [{"citation": "410 U.S. 113"}],
+                    }
+                ]
+            },
+        ):
+            verify_citations_extracted(payload, session=session)
+
+        history = get_report_verification_history(doc_id=UUID(doc_id), session=session)
+        diff = get_report_verification_diff(
+            doc_id=UUID(doc_id),
+            left_id=history[0].id,
+            right_id=history[0].id,
+            only_changes=False,
+            session=session,
+        ).model_dump()
+
+    assert diff["changes"]
+    assert diff["changes"][0]["changed_due_to_override"] is False
+
+
+def test_verification_diff_marks_override_driven_changes(tmp_path: Path) -> None:
+    doc_id = str(uuid4())
+    payload = VerifyExtractedCitationsRequest(
+        text="Roe v. Wade, 410 U.S. 113 (1973).",
+        doc_id=doc_id,
+    )
+    ambiguous_raw = {
+        "results": [
+            {
+                "citation": "410 U.S. 113",
+                "results": [
+                    {"citation": "410 U.S. 113", "case_name": "Case A"},
+                    {"citation": "410 U.S. 113", "case_name": "Case B"},
+                ],
+            }
+        ]
+    }
+    with _make_session(tmp_path) as session:
+        session.add(
+            Document(
+                doc_id=UUID(doc_id),
+                filename="fixture.pdf",
+                file_path="/tmp/fixture.pdf",
+                stub_text="Roe v. Wade, 410 U.S. 113 (1973).",
+            )
+        )
+        session.commit()
+        with patch(
+            "app.main.CourtListenerClient.lookup_citation_list",
+            return_value=ambiguous_raw,
+        ):
+            verify_citations_extracted(payload, session=session)
+            verify_citations_extracted(payload, session=session)
+        history_before = get_report_verification_history(
+            doc_id=UUID(doc_id), session=session
+        )
+        baseline_id = history_before[0].id
+        current = get_report_verification(doc_id=UUID(doc_id), session=session)
+        create_report_override(
+            doc_id=UUID(doc_id),
+            payload=CitationOverrideRequest(
+                citation_id=current.findings[0].citation_id,
+                chosen_candidate={"case_name": "Roe v. Wade"},
+            ),
+            session=session,
+        )
+        diff = get_report_verification_diff(
+            doc_id=UUID(doc_id),
+            left_id=baseline_id,
+            right_id=baseline_id,
+            session=session,
+        ).model_dump()
+
+    assert diff["changes"]
+    assert diff["changes"][0]["changed_due_to_override"] is True

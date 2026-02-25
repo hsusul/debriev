@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { Document, Page, pdfjs } from "react-pdf";
 
 import VerifyButton from "./VerifyButton";
@@ -46,6 +47,7 @@ type CitationVerificationFinding = {
   explanation: string;
   evidence: string;
   probable_case_name: string | null;
+  is_overridden: boolean;
 };
 
 type CitationVerificationSummary = {
@@ -76,6 +78,7 @@ type RiskTotals = {
   not_found: number;
   ambiguous: number;
   bogus: number;
+  overridden: number;
 };
 
 type RiskItem = {
@@ -158,6 +161,19 @@ type VerificationDiffResponse = {
   summary_changes: VerificationDiffSummary;
   status_changes: VerificationDiffStatusChange[];
   best_match_changes: VerificationDiffBestMatchChange[];
+  changes: Array<{
+    citation_id: string;
+    citation: string;
+    old_status: string;
+    new_status: string;
+    old_best_match: BestMatch | null;
+    new_best_match: BestMatch | null;
+    old_confidence: number | null;
+    new_confidence: number | null;
+    old_is_overridden: boolean;
+    new_is_overridden: boolean;
+    changed_due_to_override: boolean;
+  }>;
 };
 
 type ReportOverviewResponse = {
@@ -167,6 +183,7 @@ type ReportOverviewResponse = {
   risk_report: RiskReport | null;
   bogus_findings: BogusFinding[];
   verification_history: VerificationHistoryItem[];
+  overrides: CitationOverrideResponse[];
   export_endpoints: ReportOverviewExportEndpoints;
 };
 
@@ -184,7 +201,7 @@ type VerificationJobStatusResponse = {
   result_id: number | null;
 };
 
-type StatusFilter = "all" | "verified" | "not_found" | "ambiguous" | "bogus";
+type StatusFilter = "all" | "verified" | "not_found" | "ambiguous" | "bogus" | "overridden";
 type SortMode = "risk_desc" | "citation_asc";
 
 type CitationRow = {
@@ -287,18 +304,6 @@ async function fetchVerificationResultById(docId: string, resultId: number): Pro
   return (await response.json()) as VerifyCitationsResponse;
 }
 
-async function fetchReportOverrides(docId: string): Promise<CitationOverrideResponse[]> {
-  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/overrides`, {
-    method: "GET"
-  });
-
-  if (!response.ok) {
-    throw new Error(await parseApiError(response, "Failed to load overrides"));
-  }
-
-  return (await response.json()) as CitationOverrideResponse[];
-}
-
 async function createCitationOverride(
   docId: string,
   payload: { citation_id: string; chosen_candidate: CitationOverrideCandidate },
@@ -316,6 +321,15 @@ async function createCitationOverride(
   }
 
   return (await response.json()) as CitationOverrideResponse;
+}
+
+async function deleteCitationOverride(docId: string, citationId: string): Promise<void> {
+  const response = await fetch(`${PUBLIC_API_BASE}/reports/${docId}/overrides/${encodeURIComponent(citationId)}`, {
+    method: "DELETE"
+  });
+  if (!response.ok) {
+    throw new Error(await parseApiError(response, "Failed to remove override"));
+  }
 }
 
 async function fetchVerificationDiff(
@@ -596,6 +610,9 @@ function statusPill(status: string | null | undefined): string {
   if (value === "ambiguous") {
     return "inline-flex rounded-full border border-blue-400/40 bg-blue-500/15 px-2 py-0.5 text-xs font-medium text-blue-200";
   }
+  if (value === "overridden") {
+    return "inline-flex rounded-full border border-violet-400/40 bg-violet-500/15 px-2 py-0.5 text-xs font-medium text-violet-200";
+  }
   if (value === "bogus") {
     return "inline-flex rounded-full border border-orange-400/40 bg-orange-500/15 px-2 py-0.5 text-xs font-medium text-orange-200";
   }
@@ -615,6 +632,9 @@ function statusSeverity(status: string, relatedBogus: boolean): number {
   if (status === "ambiguous") {
     return 2;
   }
+  if (status === "overridden") {
+    return 1;
+  }
   if (status === "verified") {
     return 1;
   }
@@ -630,6 +650,9 @@ function formatHistoryTimestamp(value: string): string {
 }
 
 export default function ReportWorkspace({ docId, report }: { docId: string; report: ReportPayload }) {
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
   const [numPages, setNumPages] = useState(0);
   const [pageText, setPageText] = useState<Record<number, string>>({});
   const [selectedCitationIndex, setSelectedCitationIndex] = useState<number | null>(null);
@@ -646,6 +669,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const [jobStatusText, setJobStatusText] = useState("");
   const [runLoading, setRunLoading] = useState(false);
   const [overrideSavingCitationId, setOverrideSavingCitationId] = useState<string | null>(null);
+  const [overrideRemovingCitationId, setOverrideRemovingCitationId] = useState<string | null>(null);
   const [compareLeftId, setCompareLeftId] = useState<number | null>(null);
   const [compareRightId, setCompareRightId] = useState<number | null>(null);
   const [compareDiff, setCompareDiff] = useState<VerificationDiffResponse | null>(null);
@@ -657,12 +681,12 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
   const pageRefs = useRef<Record<number, HTMLDivElement | null>>({});
 
   const loadOverview = useCallback(async () => {
-    const [data, overrideRows] = await Promise.all([fetchReportOverview(docId), fetchReportOverrides(docId)]);
+    const data = await fetchReportOverview(docId);
     setOverview(data);
     setVerification(data.latest_verification);
     setBogusFindings(data.bogus_findings);
     setOverrides(
-      overrideRows
+      data.overrides
         .slice()
         .sort((a, b) => a.citation_id.localeCompare(b.citation_id) || b.id - a.id),
     );
@@ -675,7 +699,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
 
     const run = async () => {
       try {
-        const [data, overrideRows] = await Promise.all([fetchReportOverview(docId), fetchReportOverrides(docId)]);
+        const data = await fetchReportOverview(docId);
         if (cancelled) {
           return;
         }
@@ -683,7 +707,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
         setVerification(data.latest_verification);
         setBogusFindings(data.bogus_findings);
         setOverrides(
-          overrideRows
+          data.overrides
             .slice()
             .sort((a, b) => a.citation_id.localeCompare(b.citation_id) || b.id - a.id),
         );
@@ -739,9 +763,12 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
         const context = normalizeCitationKey(citation.context_text || "");
         return raw.includes(findingKey) || findingKey.includes(raw) || context.includes(findingKey);
       });
+      const overridden = Boolean(citationId && overrideByCitationId.has(citationId)) || Boolean(finding?.is_overridden);
       const effectiveStatus = relatedBogus
         ? "bogus"
-        : (finding?.status || citation.verification_status || "unverified");
+        : overridden
+          ? "overridden"
+          : (finding?.status || citation.verification_status || "unverified");
       return {
         citation,
         idx,
@@ -752,7 +779,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
         effectiveStatus
       };
     });
-  }, [bogusFindings, extractedCitations, findingByCitationId, report.citations, riskByCitationId]);
+  }, [bogusFindings, extractedCitations, findingByCitationId, overrideByCitationId, report.citations, riskByCitationId]);
 
   const riskRankByCitation = useMemo(() => {
     const map = new Map<string, number>();
@@ -1018,9 +1045,14 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     }
     const newest = verificationHistory[0]?.id ?? null;
     const second = verificationHistory[1]?.id ?? newest;
-    setCompareLeftId((prev) => prev ?? newest);
-    setCompareRightId((prev) => prev ?? second);
-  }, [verificationHistory]);
+    const leftFromQuery = Number(searchParams.get("left") || "");
+    const rightFromQuery = Number(searchParams.get("right") || "");
+    const validIds = new Set(verificationHistory.map((item) => item.id));
+    const left = Number.isFinite(leftFromQuery) && validIds.has(leftFromQuery) ? leftFromQuery : newest;
+    const right = Number.isFinite(rightFromQuery) && validIds.has(rightFromQuery) ? rightFromQuery : second;
+    setCompareLeftId(left);
+    setCompareRightId(right);
+  }, [searchParams, verificationHistory]);
 
   const onCompareRuns = async () => {
     if (compareLeftId === null || compareRightId === null) {
@@ -1029,6 +1061,10 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
     setCompareLoading(true);
     setVerificationBannerError("");
     try {
+      const params = new URLSearchParams(searchParams.toString());
+      params.set("left", String(compareLeftId));
+      params.set("right", String(compareRightId));
+      router.replace(`${pathname}?${params.toString()}`);
       const diff = await fetchVerificationDiff(docId, compareLeftId, compareRightId);
       setCompareDiff(diff);
     } catch (err) {
@@ -1158,7 +1194,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
               <p className="text-xs uppercase tracking-wide text-slate-400">Score</p>
               <p className="mt-1 text-2xl font-semibold text-blue-200">{overview.risk_report.score}</p>
               <p className="mt-2 text-xs text-slate-400">
-                verified {overview.risk_report.totals.verified} / ambiguous {overview.risk_report.totals.ambiguous} / not_found {overview.risk_report.totals.not_found} / bogus {overview.risk_report.totals.bogus}
+                verified {overview.risk_report.totals.verified} / overridden {overview.risk_report.totals.overridden} / ambiguous {overview.risk_report.totals.ambiguous} / not_found {overview.risk_report.totals.not_found} / bogus {overview.risk_report.totals.bogus}
               </p>
             </div>
             <div className="rounded-lg border border-slate-700 bg-slate-800/70 p-3">
@@ -1246,6 +1282,34 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
             {compareLoading ? "Comparing..." : "Compare"}
           </button>
         </div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              const newest = verificationHistory[0]?.id ?? null;
+              const previous = verificationHistory[1]?.id ?? newest;
+              setCompareLeftId(previous);
+              setCompareRightId(newest);
+            }}
+            disabled={verificationHistory.length === 0}
+            className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Preset: previous → latest
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const oldest = verificationHistory[verificationHistory.length - 1]?.id ?? null;
+              const newest = verificationHistory[0]?.id ?? null;
+              setCompareLeftId(oldest);
+              setCompareRightId(newest);
+            }}
+            disabled={verificationHistory.length === 0}
+            className="rounded-md border border-slate-700 bg-slate-800 px-2 py-1 text-xs text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            Preset: oldest → latest
+          </button>
+        </div>
         {compareDiff ? (
           <div className="mt-3 space-y-2 rounded-lg border border-slate-700 bg-slate-800/60 p-3 text-xs">
             <p className="text-slate-300">
@@ -1256,20 +1320,24 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
               Left total {compareDiff.summary_changes.left_total} / Right total {compareDiff.summary_changes.right_total}
             </p>
             <div>
-              <p className="font-medium text-slate-200">Status changes ({compareDiff.status_changes.length})</p>
-              {compareDiff.status_changes.length === 0 ? (
+              <p className="font-medium text-slate-200">Changes ({compareDiff.changes.length})</p>
+              {compareDiff.changes.length === 0 ? (
                 <p className="text-slate-400">None</p>
               ) : (
                 <ul className="mt-1 list-disc pl-5 text-slate-300">
-                  {compareDiff.status_changes.slice(0, 20).map((item) => (
-                    <li key={`status-${item.citation_id}`}>
-                      {item.citation}: {item.left_status} → {item.right_status}
+                  {compareDiff.changes.slice(0, 20).map((item) => (
+                    <li key={`change-${item.citation_id}`}>
+                      {item.citation}: {item.old_status} → {item.new_status}
+                      {typeof item.old_confidence === "number" || typeof item.new_confidence === "number"
+                        ? ` (conf ${item.old_confidence ?? "-"} → ${item.new_confidence ?? "-"})`
+                        : ""}
+                      {item.changed_due_to_override ? " [override]" : ""}
                     </li>
                   ))}
                 </ul>
               )}
             </div>
-            <div>
+            <div className="hidden">
               <p className="font-medium text-slate-200">Best match changes ({compareDiff.best_match_changes.length})</p>
               {compareDiff.best_match_changes.length === 0 ? (
                 <p className="text-slate-400">None</p>
@@ -1341,6 +1409,7 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                 <option value="verified">Verified</option>
                 <option value="not_found">Not found</option>
                 <option value="ambiguous">Ambiguous</option>
+                <option value="overridden">Overridden</option>
                 <option value="bogus">Bogus</option>
               </select>
               <select
@@ -1407,7 +1476,14 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                         {truncateContext(citation.context_text) || "-"}
                       </td>
                       <td className="border-b border-slate-800 px-2 py-2 align-top">
-                        <span className={statusPill(effectiveStatus)}>{effectiveStatus}</span>
+                        <div className="flex flex-wrap items-center gap-1">
+                          <span className={statusPill(effectiveStatus)}>{effectiveStatus}</span>
+                          {row.citationId && overrideByCitationId.has(row.citationId) ? (
+                            <span className="inline-flex rounded-full border border-violet-500/40 bg-violet-500/10 px-2 py-0.5 text-[10px] font-medium text-violet-200">
+                              override
+                            </span>
+                          ) : null}
+                        </div>
                       </td>
                       <td className="border-b border-slate-800 px-2 py-2 align-top">
                         {link ? (
@@ -1445,6 +1521,36 @@ export default function ReportWorkspace({ docId, report }: { docId: string; repo
                       : "-"}
                   </span>
                 </p>
+                {selectedOverride && selectedFinding ? (
+                  <p>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void (async () => {
+                          setVerificationBannerError("");
+                          setOverrideRemovingCitationId(selectedFinding.citation_id);
+                          try {
+                            await deleteCitationOverride(docId, selectedFinding.citation_id);
+                            await loadOverview();
+                            if (activeHistoryId !== null) {
+                              const result = await fetchVerificationResultById(docId, activeHistoryId);
+                              setVerification(result);
+                            }
+                          } catch (err) {
+                            const message = err instanceof Error ? err.message : "Failed to remove override";
+                            setVerificationBannerError(message);
+                          } finally {
+                            setOverrideRemovingCitationId(null);
+                          }
+                        })();
+                      }}
+                      disabled={overrideRemovingCitationId === selectedFinding.citation_id}
+                      className="rounded-md border border-violet-700 bg-violet-900/30 px-2 py-1 text-xs text-violet-100 hover:bg-violet-800/40 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {overrideRemovingCitationId === selectedFinding.citation_id ? "Removing..." : "Remove override"}
+                    </button>
+                  </p>
+                ) : null}
                 <p>
                   <span className="text-slate-400">Evidence:</span>{" "}
                   <span className="text-slate-100">{selectedFinding?.evidence || "-"}</span>

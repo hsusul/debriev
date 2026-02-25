@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import JSON, Column, String, Text
+from sqlalchemy import JSON, Column, String, Text, UniqueConstraint
 
 try:
     from sqlmodel import Field, SQLModel
@@ -108,6 +108,10 @@ class VerificationJob(SQLModel, table=True):
 
 
 class CitationOverride(SQLModel, table=True):
+    __table_args__ = (
+        UniqueConstraint("doc_id", "citation_id", name="uq_citation_override_doc_cit"),
+    )
+
     id: int | None = Field(default=None, primary_key=True)
     doc_id: str = Field(index=True)
     citation_id: str = Field(index=True)
@@ -117,3 +121,4 @@ class CitationOverride(SQLModel, table=True):
     )
     chosen_year: int | None = Field(default=None)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
