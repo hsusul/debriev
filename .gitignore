@@ -79,3 +79,4 @@ temp/
 
 # Local Codex machine config
 .codex/config.toml.codex/
+.codex/
