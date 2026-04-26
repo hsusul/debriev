@@ -1,0 +1,81 @@
+# Debriev: local-only, generated, and sensitive artifacts
+
+# OS and editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Environment and secrets
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python caches and test tooling
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Python packaging/build artifacts
+build/
+dist/
+.eggs/
+*.egg-info/
+pip-wheel-metadata/
+
+# Frontend dependencies and build caches
+node_modules/
+.vite/
+*.tsbuildinfo
+
+# Frontend test/build output
+coverage/
+storybook-static/
+
+# Local databases and retrieval stores
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.duckdb
+
+# Runtime logs and temporary artifacts
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Debriev local runtime/storage directories
+/data/
+/uploads/
+/storage/
+/instance/
+/reports/
+
+# Local Codex machine config
+.codex/config.toml

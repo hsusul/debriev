@@ -1,0 +1,93 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+
+  /* Layered dark surface system: 0 → 1 → 2 → 3 */
+  --background: 0 0% 5.5%;        /* #0e0e0e - deepest base */
+  --foreground: 0 0% 93%;         /* #ededed - high contrast text */
+
+  --surface-0: 0 0% 5.5%;         /* same as background */
+  --surface-1: 0 0% 8%;           /* #141414 - panels, sidebars */
+  --surface-2: 0 0% 10.5%;        /* #1a1a1a - cards, sections */
+  --surface-3: 0 0% 13%;          /* #212121 - elevated elements */
+
+  --card: 0 0% 8%;
+  --card-foreground: 0 0% 93%;
+  --popover: 0 0% 10%;
+  --popover-foreground: 0 0% 93%;
+
+  --primary: 0 0% 93%;
+  --primary-foreground: 0 0% 5.5%;
+  --secondary: 0 0% 12%;
+  --secondary-foreground: 0 0% 93%;
+
+  --muted: 0 0% 12%;
+  --muted-foreground: 0 0% 55%;
+
+  --accent: 0 0% 14%;
+  --accent-foreground: 0 0% 93%;
+
+  --destructive: 0 62% 35%;
+  --destructive-foreground: 0 0% 93%;
+
+  --border: 0 0% 14%;
+  --input: 0 0% 14%;
+  --ring: 0 0% 30%;
+
+  /* Verdict colors: desaturated for dark mode legibility */
+  --verdict-supported: 152 40% 48%;
+  --verdict-partial: 200 45% 55%;
+  --verdict-overstated: 30 65% 55%;
+  --verdict-ambiguous: 42 55% 55%;
+  --verdict-unsupported: 4 55% 55%;
+  --verdict-unverified: 220 8% 55%;
+
+  --radius: 0.375rem;
+}
+
+* {
+  @apply border-border;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  @apply bg-background font-sans text-foreground antialiased;
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+::selection {
+  background: hsl(var(--accent) / 0.3);
+  color: hsl(var(--foreground));
+}
+
+/* Scrollbar styling for dark mode */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(0 0% 20%);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(0 0% 28%);
+}
