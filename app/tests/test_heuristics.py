@@ -91,8 +91,29 @@ def test_verification_heuristics_flag_missing_citation() -> None:
 
     result = evaluate_heuristics(claim, links=[], segments=[])
 
-    assert result.verdict == SupportStatus.UNVERIFIED
+    assert result.verdict == SupportStatus.UNSUPPORTED
     assert "missing_citation" in result.flags
+    assert result.reasoning == ["No citation or verified authority supports this claim."]
+
+
+def test_verification_heuristics_mark_case_citation_without_support_ambiguous() -> None:
+    claim = build_claim("Under Smith v. Jones, Doe signed the contract.")
+
+    result = evaluate_heuristics(claim, links=[], segments=[])
+
+    assert result.verdict == SupportStatus.AMBIGUOUS
+    assert "missing_citation" in result.flags
+    assert result.reasoning == ["Citation present but no verified authority."]
+
+
+def test_verification_heuristics_mark_strong_universal_without_support_overstated() -> None:
+    claim = build_claim("Doe must always disclose all defects.")
+
+    result = evaluate_heuristics(claim, links=[], segments=[])
+
+    assert result.verdict == SupportStatus.OVERSTATED
+    assert "missing_citation" in result.flags
+    assert "absolute_qualifier_mismatch" in result.flags
 
 
 def test_verification_heuristics_flag_absolute_qualifier_mismatch() -> None:
@@ -379,7 +400,7 @@ def test_verification_classifier_keeps_blocking_flags_deterministic() -> None:
 
     result = classifier.verify(claim, links=[], segments=[])
 
-    assert result.verdict == SupportStatus.UNVERIFIED
+    assert result.verdict == SupportStatus.UNSUPPORTED
     assert provider.calls == 0
     assert result.primary_anchor is None
     assert result.support_assessments == []

@@ -104,6 +104,229 @@ def test_draft_endpoints_round_trip_evidence_bundle_reference(
     assert fetched_payload["evidence_bundle_id"] == str(bundle.id)
 
 
+def test_create_draft_from_text_creates_reviewable_draft(
+    client: TestClient,
+    session: Session,
+) -> None:
+    response = client.post(
+        "/api/v1/drafts",
+        json={
+            "draft_text": "Breach of Contract\n\nDoe signed the agreement on March 1.\n\nDoe never delivered the notice.",
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["draft_id"] is not None
+    assert payload["matter_id"] is not None
+    assert payload["title"] == "Breach of Contract"
+    assert payload["assertion_count"] == 3
+    assert payload["claim_count"] >= 2
+
+    draft = session.get(Draft, uuid.UUID(payload["draft_id"]))
+    assert draft is not None
+    assert draft.title == "Breach of Contract"
+    assert draft.matter_id == uuid.UUID(payload["matter_id"])
+
+    assertions = session.query(Assertion).filter(Assertion.draft_id == draft.id).order_by(Assertion.paragraph_index).all()
+    assert [assertion.raw_text for assertion in assertions] == [
+        "Breach of Contract",
+        "Doe signed the agreement on March 1.",
+        "Doe never delivered the notice.",
+    ]
+
+    claims = session.query(ClaimUnit).join(Assertion).filter(Assertion.draft_id == draft.id).all()
+    assert len(claims) == payload["claim_count"]
+    assert all(claim.support_status == SupportStatus.UNVERIFIED for claim in claims)
+
+
+def test_citation_verification_endpoint_surfaces_recognized_but_unresolved_partial_citation(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_provider(monkeypatch, provider=None, api_key=None)
+
+    response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": (
+                "Citation Memo\n\n"
+                "Under Smith v. Jones, Doe had to provide notice.\n\n"
+                "Doe always had to provide notice."
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["draft_id"] is not None
+    assert payload["matter_id"] is not None
+    assert payload["title"] == "Citation Memo"
+    assert payload["review_run_id"] is not None
+    assert payload["reviewed_at"] is not None
+    assert payload["summary"]["total_claims"] >= 2
+    assert payload["summary"]["total_cited_propositions"] == 1
+    assert payload["summary"]["flagged_citation_count"] == 1
+    assert payload["summary"]["verdict_counts"]["ambiguous"] == 1
+    assert payload["summary"]["authority_status_counts"]["authority_unverified"] == 1
+    assert payload["summary"]["authority_status_counts"]["citation_recognized"] == 1
+    assert payload["summary"]["authority_status_counts"]["authority_candidate_parsed"] == 0
+    assert payload["summary"]["authority_status_counts"]["authority_matched"] == 0
+    assert [item["citation_text"] for item in payload["citations"]] == ["Smith v. Jones"]
+    assert payload["citations"][0]["proposition_text"] == "Under Smith v. Jones, Doe had to provide notice."
+    assert payload["citations"][0]["authority_status"] == "citation_recognized"
+    assert payload["citations"][0]["authority_match_status"] == "recognized_only"
+    assert payload["citations"][0]["parsed_authority"] == {
+        "case_name": "Smith v. Jones",
+        "reporter_volume": None,
+        "reporter_abbreviation": None,
+        "first_page": None,
+        "court": None,
+        "year": None,
+    }
+    assert payload["citations"][0]["normalized_authority_reference"] == "smith v jones"
+    assert payload["citations"][0]["matched_authority"] is None
+    assert payload["citations"][0]["proposition_verdict"] == SupportStatus.AMBIGUOUS.value
+    assert payload["citations"][0]["reasoning"] is not None
+    assert payload["citations"][0]["support_snippet"] is None
+
+
+def test_citation_verification_endpoint_matches_known_authority_from_mvp_catalog(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_provider(monkeypatch, provider=None, api_key=None)
+
+    response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": (
+                "Brown v. Board of Education, 347 U.S. 483 (1954), held that segregation in public schools "
+                "violates equal protection."
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["summary"]["total_cited_propositions"] == 1
+    assert payload["summary"]["flagged_citation_count"] == 1
+    assert payload["summary"]["verdict_counts"]["ambiguous"] == 1
+    assert payload["summary"]["authority_status_counts"]["authority_unverified"] == 0
+    assert payload["summary"]["authority_status_counts"]["authority_matched"] == 1
+    assert payload["citations"][0]["citation_text"] == "Brown v. Board of Education, 347 U.S. 483 (1954)"
+    assert payload["citations"][0]["authority_status"] == "authority_matched"
+    assert payload["citations"][0]["authority_match_status"] == "matched"
+    assert payload["citations"][0]["parsed_authority"] == {
+        "case_name": "Brown v. Board of Education",
+        "reporter_volume": "347",
+        "reporter_abbreviation": "U.S.",
+        "first_page": "483",
+        "court": None,
+        "year": 1954,
+    }
+    assert (
+        payload["citations"][0]["normalized_authority_reference"]
+        == "brown v board of education|347|u.s.|483|1954"
+    )
+    assert payload["citations"][0]["matched_authority"] == {
+        "authority_id": "brown-v-board-of-education-347-us-483",
+        "canonical_name": "Brown v. Board of Education",
+        "canonical_citation": "Brown v. Board of Education, 347 U.S. 483 (1954)",
+        "reporter_volume": "347",
+        "reporter_abbreviation": "U.S.",
+        "first_page": "483",
+        "court": None,
+        "year": 1954,
+        "source_name": "debriev_mvp_authority_catalog",
+    }
+    assert payload["citations"][0]["proposition_verdict"] == SupportStatus.AMBIGUOUS.value
+
+
+def test_citation_verification_endpoint_surfaces_parseable_but_unmatched_authority(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_provider(monkeypatch, provider=None, api_key=None)
+
+    response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": "Brown v. Davis, 999 U.S. 1 (2001), held that negligence is always enough.",
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["summary"]["total_cited_propositions"] == 1
+    assert payload["summary"]["authority_status_counts"]["authority_unverified"] == 1
+    assert payload["summary"]["authority_status_counts"]["authority_candidate_parsed"] == 1
+    assert payload["summary"]["authority_status_counts"]["citation_recognized"] == 0
+    assert payload["summary"]["authority_status_counts"]["authority_matched"] == 0
+    assert payload["citations"][0]["authority_status"] == "authority_candidate_parsed"
+    assert payload["citations"][0]["authority_match_status"] == "no_match"
+    assert payload["citations"][0]["parsed_authority"] == {
+        "case_name": "Brown v. Davis",
+        "reporter_volume": "999",
+        "reporter_abbreviation": "U.S.",
+        "first_page": "1",
+        "court": None,
+        "year": 2001,
+    }
+    assert payload["citations"][0]["matched_authority"] is None
+
+
+def test_citation_verification_endpoint_pairs_multiple_citations_and_summary_counts_align(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_provider(monkeypatch, provider=None, api_key=None)
+
+    response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": (
+                "Brown v. Board of Education, 347 U.S. 483 (1954), held that segregation in public schools "
+                "violates equal protection. Brown v. Davis, 999 U.S. 1 (2001), held that negligence is always enough."
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["summary"]["total_cited_propositions"] == 2
+    assert payload["summary"]["flagged_citation_count"] == 2
+    assert [item["citation_text"] for item in payload["citations"]] == [
+        "Brown v. Board of Education, 347 U.S. 483 (1954)",
+        "Brown v. Davis, 999 U.S. 1 (2001)",
+    ]
+    assert [item["proposition_text"] for item in payload["citations"]] == [
+        (
+            "Brown v. Board of Education, 347 U.S. 483 (1954), held that segregation in public schools "
+            "violates equal protection."
+        ),
+        "Brown v. Davis, 999 U.S. 1 (2001), held that negligence is always enough.",
+    ]
+    assert [item["authority_status"] for item in payload["citations"]] == [
+        "authority_matched",
+        "authority_candidate_parsed",
+    ]
+    assert payload["summary"]["authority_status_counts"] == {
+        "authority_unverified": 1,
+        "citation_recognized": 0,
+        "authority_candidate_parsed": 1,
+        "authority_matched": 1,
+        "linked_authority_support_present": 0,
+        "not_reviewed": 0,
+    }
+    verdict_total = sum(payload["summary"]["verdict_counts"].values())
+    authority_total = sum(payload["summary"]["authority_status_counts"].values()) - payload["summary"][
+        "authority_status_counts"
+    ]["authority_unverified"]
+    assert verdict_total == len(payload["citations"])
+    assert authority_total == len(payload["citations"])
+
+
 def test_compile_endpoint_returns_structured_compile_output(
     client: TestClient,
     session: Session,
@@ -123,8 +346,8 @@ def test_compile_endpoint_returns_structured_compile_output(
         "partially_supported": 1,
         "overstated": 0,
         "ambiguous": 1,
-        "unsupported": 1,
-        "unverified": 1,
+        "unsupported": 2,
+        "unverified": 0,
     }
     assert [claim["claim_text"] for claim in payload["flagged_claims"]] == [
         "Doe signed the contract on March 1.",
@@ -196,10 +419,10 @@ def test_review_endpoint_returns_structured_review_output(
     ]
     assert payload["resolved_claims"] == []
     assert payload["flagged_claim_counts"] == {
-        "unsupported": 1,
+        "unsupported": 2,
         "overstated": 1,
         "ambiguous": 1,
-        "unverified": 1,
+        "unverified": 0,
         "total": 4,
     }
     assert payload["review_overview"] == {
@@ -214,12 +437,13 @@ def test_review_endpoint_returns_structured_review_output(
     }
     assert [claim["claim_text"] for claim in payload["top_risky_claims"]] == [
         "Doe delivered the notice.",
+        "Doe admitted the error.",
         "Doe reviewed the contract and approved the invoice.",
         "Doe signed the contract on March 1.",
-        "Doe admitted the error.",
     ]
     assert [claim["claim_text"] for claim in payload["issue_buckets"]["unsupported"]] == [
         "Doe delivered the notice.",
+        "Doe admitted the error.",
     ]
     assert [claim["claim_text"] for claim in payload["issue_buckets"]["overstated"]] == [
         "Doe reviewed the contract and approved the invoice.",
@@ -227,9 +451,7 @@ def test_review_endpoint_returns_structured_review_output(
     assert [claim["claim_text"] for claim in payload["issue_buckets"]["ambiguous"]] == [
         "Doe signed the contract on March 1.",
     ]
-    assert [claim["claim_text"] for claim in payload["issue_buckets"]["unverified"]] == [
-        "Doe admitted the error.",
-    ]
+    assert payload["issue_buckets"]["unverified"] == []
     assert [bucket["flag"] for bucket in payload["flag_buckets"]] == [
         "contextual_support_only",
         "missing_citation",
@@ -242,8 +464,8 @@ def test_review_endpoint_returns_structured_review_output(
             "partially_supported": 0,
             "overstated": 1,
             "ambiguous": 1,
-            "unsupported": 1,
-            "unverified": 1,
+            "unsupported": 2,
+            "unverified": 0,
         },
         "most_unstable_claim_ids": [],
         "repeatedly_changed_claim_ids": [],
@@ -291,10 +513,10 @@ def test_review_endpoint_preserves_structured_support_in_review_buckets(
     assert payload["draft_id"] == str(draft_id)
     assert payload["total_claims"] == 5
     assert payload["flagged_claim_counts"] == {
-        "unsupported": 1,
+        "unsupported": 2,
         "ambiguous": 1,
         "overstated": 0,
-        "unverified": 1,
+        "unverified": 0,
         "total": 3,
     }
     assert payload["review_overview"] == {
@@ -309,19 +531,18 @@ def test_review_endpoint_preserves_structured_support_in_review_buckets(
     }
     assert [claim["claim_text"] for claim in payload["top_risky_claims"]] == [
         "Doe delivered the notice.",
-        "Doe signed the contract on March 1.",
         "Doe admitted the error.",
+        "Doe signed the contract on March 1.",
     ]
     assert [claim["claim_text"] for claim in payload["issue_buckets"]["unsupported"]] == [
         "Doe delivered the notice.",
+        "Doe admitted the error.",
     ]
     assert payload["issue_buckets"]["overstated"] == []
     assert [claim["claim_text"] for claim in payload["issue_buckets"]["ambiguous"]] == [
         "Doe signed the contract on March 1.",
     ]
-    assert [claim["claim_text"] for claim in payload["issue_buckets"]["unverified"]] == [
-        "Doe admitted the error.",
-    ]
+    assert payload["issue_buckets"]["unverified"] == []
     assert [bucket["flag"] for bucket in payload["flag_buckets"]] == [
         "contextual_support_only",
         "missing_citation",

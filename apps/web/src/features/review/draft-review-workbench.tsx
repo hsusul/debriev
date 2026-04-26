@@ -1,5 +1,6 @@
+import type { ChangeEvent } from "react"
 import { useEffect, useMemo, useState } from "react"
-import { AlertCircle, LoaderCircle } from "lucide-react"
+import { AlertCircle, LoaderCircle, Upload } from "lucide-react"
 
 import { AppLayout } from "@/components/layout/app-layout"
 import { WorkspaceLayout } from "@/components/layout/workspace-layout"
@@ -7,10 +8,12 @@ import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { adaptClaimReviewHistory, buildDefaultResolutionState, buildWorkspaceData } from "@/features/review/adapters"
 import {
+  createDraft,
   fetchClaimReviewHistory,
   fetchDraftReviewState,
   rerunDraftReview,
   resolveDraftId,
+  setDraftIdInUrl,
   submitClaimDecision,
 } from "@/features/review/api"
 import type {
@@ -42,7 +45,7 @@ const verdictOrder: ReviewVerdict[] = [
 ]
 
 export function DraftReviewWorkbench() {
-  const draftId = useMemo(() => resolveDraftId(), [])
+  const [draftId, setDraftId] = useState<string | null>(() => resolveDraftId())
   const [workspaceData, setWorkspaceData] = useState<ReviewWorkspaceData | null>(null)
   const [selectedClaimId, setSelectedClaimId] = useState("")
   const [verdictFilter, setVerdictFilter] = useState<ReviewVerdict | "all">("all")
@@ -54,6 +57,18 @@ export function DraftReviewWorkbench() {
   const [isHydrating, setIsHydrating] = useState(draftId != null)
   const [isRerunning, setIsRerunning] = useState(false)
   const [backendError, setBackendError] = useState<string | null>(null)
+  const [draftText, setDraftText] = useState("")
+  const [isCreatingDraft, setIsCreatingDraft] = useState(false)
+  const [draftIntakeError, setDraftIntakeError] = useState<string | null>(null)
+
+  useEffect(() => {
+    function handlePopstate() {
+      setDraftId(resolveDraftId())
+    }
+
+    window.addEventListener("popstate", handlePopstate)
+    return () => window.removeEventListener("popstate", handlePopstate)
+  }, [])
 
   useEffect(() => {
     const resolvedDraftId = draftId
@@ -384,11 +399,57 @@ export function DraftReviewWorkbench() {
     }
   }
 
+  async function handleCreateDraft() {
+    const trimmedDraftText = draftText.trim()
+    if (!trimmedDraftText) {
+      return
+    }
+
+    setDraftIntakeError(null)
+    setIsCreatingDraft(true)
+
+    try {
+      const created = await createDraft({ draftText: trimmedDraftText })
+      setDraftIdInUrl(created.draft_id)
+      setDraftId(created.draft_id)
+      setDraftText("")
+      setWorkspaceData(null)
+      setSelectedClaimId("")
+      setClaimHistoryById({})
+      setClaimHistoryErrorById({})
+      setLoadingClaimHistoryId(null)
+      setResolutionStateById({})
+      setIsHydrating(true)
+    } catch (error) {
+      setDraftIntakeError(getErrorMessage(error))
+    } finally {
+      setIsCreatingDraft(false)
+    }
+  }
+
+  async function handleDraftFileUpload(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0]
+    if (file == null) {
+      return
+    }
+
+    setDraftIntakeError(null)
+    try {
+      const text = await file.text()
+      setDraftText(text)
+    } catch {
+      setDraftIntakeError("Unable to read the selected text file.")
+    } finally {
+      event.target.value = ""
+    }
+  }
+
   return (
     <AppLayout>
       <WorkspaceLayout
         leftPane={
           <ReviewQueue
+            noDraftLoaded={draftId == null}
             queueSections={queueSections}
             resolutionStateById={resolutionStateById}
             selectedClaimId={selectedClaim?.id ?? ""}
@@ -412,37 +473,48 @@ export function DraftReviewWorkbench() {
           />
         }
         centerPane={
-          <ClaimFocusPane
-            draftId={draftId}
-            claim={selectedClaim}
-            claimHistory={selectedClaimHistory}
-            resolvedClaim={selectedResolvedClaim}
-            selectedIndex={selectedIndex}
-            visibleClaimCount={orderedVisibleClaims.length}
-            nextClaim={orderedVisibleClaims[selectedIndex + 1] ?? null}
-            resolutionState={selectedResolution}
-            hasPrevious={hasPrevious}
-            hasNext={hasNext}
-            isHydrating={isHydrating}
-            isRerunning={isRerunning}
-            isClaimHistoryLoading={isClaimHistoryLoading}
-            backendError={backendError}
-            claimHistoryError={selectedClaimHistoryError}
-            needsFreshReview={needsFreshReview}
-            freshness={workspaceData?.freshness ?? null}
-            latestReviewRun={workspaceData?.latestReviewRun ?? null}
-            onPrevious={() => moveSelection(-1)}
-            onNext={() => moveSelection(1)}
-            onResolutionAction={updateResolutionAction}
-            onResolutionNoteChange={updateResolutionNote}
-            onProposedClaimTextChange={updateProposedClaimText}
-            onSubmitResolution={submitResolution}
-            onRetry={hydrateReviewState}
-            onRerun={handleRerunReview}
-          />
+          draftId == null ? (
+            <DraftIntakePane
+              draftText={draftText}
+              intakeError={draftIntakeError}
+              isCreatingDraft={isCreatingDraft}
+              onDraftTextChange={setDraftText}
+              onDraftFileUpload={handleDraftFileUpload}
+              onCreateDraft={handleCreateDraft}
+            />
+          ) : (
+            <ClaimFocusPane
+              claim={selectedClaim}
+              claimHistory={selectedClaimHistory}
+              resolvedClaim={selectedResolvedClaim}
+              selectedIndex={selectedIndex}
+              visibleClaimCount={orderedVisibleClaims.length}
+              nextClaim={orderedVisibleClaims[selectedIndex + 1] ?? null}
+              resolutionState={selectedResolution}
+              hasPrevious={hasPrevious}
+              hasNext={hasNext}
+              isHydrating={isHydrating}
+              isRerunning={isRerunning}
+              isClaimHistoryLoading={isClaimHistoryLoading}
+              backendError={backendError}
+              claimHistoryError={selectedClaimHistoryError}
+              needsFreshReview={needsFreshReview}
+              freshness={workspaceData?.freshness ?? null}
+              latestReviewRun={workspaceData?.latestReviewRun ?? null}
+              onPrevious={() => moveSelection(-1)}
+              onNext={() => moveSelection(1)}
+              onResolutionAction={updateResolutionAction}
+              onResolutionNoteChange={updateResolutionNote}
+              onProposedClaimTextChange={updateProposedClaimText}
+              onSubmitResolution={submitResolution}
+              onRetry={hydrateReviewState}
+              onRerun={handleRerunReview}
+            />
+          )
         }
         rightPane={
           <EvidenceInspector
+            noDraftLoaded={draftId == null}
             claim={selectedClaim}
             claimHistory={selectedClaimHistory}
             isLoading={isClaimHistoryLoading}
@@ -453,8 +525,93 @@ export function DraftReviewWorkbench() {
   )
 }
 
+function DraftIntakePane({
+  draftText,
+  intakeError,
+  isCreatingDraft,
+  onDraftTextChange,
+  onDraftFileUpload,
+  onCreateDraft,
+}: {
+  draftText: string
+  intakeError: string | null
+  isCreatingDraft: boolean
+  onDraftTextChange: (text: string) => void
+  onDraftFileUpload: (event: ChangeEvent<HTMLInputElement>) => void
+  onCreateDraft: () => void
+}) {
+  const canCreateDraft = draftText.trim().length > 0 && !isCreatingDraft
+
+  return (
+    <div className="relative flex h-full flex-col bg-background">
+      <div className="shrink-0 border-b border-border/15 px-6 py-3">
+        <div className="text-[11px] text-muted-foreground/55">No draft loaded</div>
+      </div>
+
+      <ScrollArea className="flex-1">
+        <article className="mx-auto max-w-3xl px-8 py-12 lg:py-16 animate-in fade-in duration-300">
+          <div className="space-y-8">
+            <div className="border-b border-border/15 pb-4">
+              <h1 className="font-serif text-2xl font-medium leading-[1.4] tracking-tight text-foreground md:text-3xl md:leading-[1.35]">
+                Start a draft review
+              </h1>
+              <p className="mt-3 max-w-2xl text-[14px] leading-relaxed text-muted-foreground/70">
+                Paste draft text or load a .txt file to create a review workspace.
+              </p>
+            </div>
+
+            <section className="space-y-3">
+              <label htmlFor="draft-text" className="text-[11px] text-muted-foreground/45">
+                Draft text
+              </label>
+              <textarea
+                id="draft-text"
+                value={draftText}
+                onChange={(event) => onDraftTextChange(event.target.value)}
+                placeholder="Paste legal draft text here."
+                className="min-h-[280px] w-full resize-none rounded-md border border-border/20 bg-surface-1 px-4 py-3 text-sm leading-6 text-foreground outline-none transition-colors placeholder:text-muted-foreground/40 focus:border-border/60 focus:ring-2 focus:ring-ring"
+              />
+            </section>
+
+            <div className="flex flex-wrap items-center gap-3">
+              <label
+                htmlFor="draft-upload"
+                className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-md border border-input bg-background px-4 text-sm font-medium text-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+              >
+                <Upload className="h-4 w-4" />
+                Load .txt
+              </label>
+              <input
+                id="draft-upload"
+                type="file"
+                accept=".txt,text/plain"
+                className="hidden"
+                onChange={onDraftFileUpload}
+              />
+            </div>
+
+            {intakeError ? <InlineNotice tone="error">{intakeError}</InlineNotice> : null}
+
+            <div className="flex items-center justify-end border-t border-border/15 pt-4">
+              <Button onClick={onCreateDraft} disabled={!canCreateDraft}>
+                {isCreatingDraft ? (
+                  <>
+                    <LoaderCircle className="h-4 w-4 animate-spin" />
+                    Creating draft
+                  </>
+                ) : (
+                  "Create draft"
+                )}
+              </Button>
+            </div>
+          </div>
+        </article>
+      </ScrollArea>
+    </div>
+  )
+}
+
 function ClaimFocusPane({
-  draftId,
   claim,
   claimHistory,
   resolvedClaim,
@@ -481,7 +638,6 @@ function ClaimFocusPane({
   onRetry,
   onRerun,
 }: {
-  draftId: string | null
   claim: SelectedClaimDetail | null
   claimHistory: ClaimReviewHistory | null
   resolvedClaim: ResolvedClaimListItem | null
@@ -508,15 +664,6 @@ function ClaimFocusPane({
   onRetry: () => void
   onRerun: () => void
 }) {
-  if (draftId == null) {
-    return (
-      <StatusPane
-        title="Draft target required"
-        body="Set ?draftId=... in the URL or provide VITE_DEBRIEV_DRAFT_ID before loading the workbench."
-      />
-    )
-  }
-
   if (isHydrating && claim == null && freshness == null && backendError == null) {
     return <StatusPane title="Loading review state" body="Hydrating the current persisted review queue." loading />
   }
@@ -529,6 +676,20 @@ function ClaimFocusPane({
         action={
           <Button variant="outline" size="sm" onClick={onRetry}>
             Retry
+          </Button>
+        }
+      />
+    )
+  }
+
+  if (claim == null && freshness != null && !freshness.hasPersistedReviewRuns) {
+    return (
+      <StatusPane
+        title="No review has been run yet"
+        body="Click Run to analyze this draft."
+        action={
+          <Button variant="outline" size="sm" onClick={onRerun}>
+            Run review
           </Button>
         }
       />
@@ -584,9 +745,16 @@ function ClaimFocusPane({
         {backendError ? <InlineNotice tone="error" className="mt-3">{backendError}</InlineNotice> : null}
         {claimHistoryError ? <InlineNotice tone="error" className="mt-3">{claimHistoryError}</InlineNotice> : null}
         {isRerunning ? <InlineNotice className="mt-3">Fresh review execution in progress. The queue will refresh when the run completes.</InlineNotice> : null}
+        {!isRerunning && freshness?.hasPersistedReviewRuns && latestReviewRun ? (
+          <InlineNotice className="mt-3">
+            {freshness.stateSource === "fresh_execution"
+              ? `Showing fresh execution from ${formatTimestamp(latestReviewRun.createdAt)}.`
+              : `Viewing persisted queue state from the review run at ${formatTimestamp(latestReviewRun.createdAt)}.`}
+          </InlineNotice>
+        ) : null}
         {needsFreshReview ? (
           <InlineNotice className="mt-3">
-            No persisted fresh review runs exist for this draft yet. Run review to replace fallback persisted claim status with fresh verification results.
+            No fresh review run exists yet. Click Run to analyze this draft.
           </InlineNotice>
         ) : null}
         {freshness?.isStale ? (
@@ -594,6 +762,7 @@ function ClaimFocusPane({
             Current review state has changed since the last fresh run.
             {freshness.hasDecisionsAfterLatestRun ? " Reviewer decisions were recorded after the last run." : ""}
             {freshness.hasVerificationActivityAfterLatestRun ? " Verification activity was added after the last run." : ""}
+            {" "}Rerun recommended.
           </InlineNotice>
         ) : null}
       </div>

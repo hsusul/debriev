@@ -15,6 +15,19 @@ class DraftCreate(BaseModel):
     evidence_bundle_id: UUID | None = None
 
 
+class DraftTextCreate(BaseModel):
+    draft_text: str = Field(..., min_length=1)
+    title: str | None = Field(default=None, min_length=1, max_length=255)
+
+
+class DraftTextCreateRead(BaseModel):
+    draft_id: UUID
+    matter_id: UUID
+    title: str
+    assertion_count: int
+    claim_count: int
+
+
 class DraftRead(ORMModel):
     id: UUID
     matter_id: UUID

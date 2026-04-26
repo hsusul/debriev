@@ -2,6 +2,8 @@ import { render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
+import { VerdictBadge } from "@/components/review/verdict-badge"
+
 import { DraftReviewWorkbench } from "./draft-review-workbench"
 
 describe("DraftReviewWorkbench", () => {
@@ -11,6 +13,130 @@ describe("DraftReviewWorkbench", () => {
 
   afterEach(() => {
     vi.restoreAllMocks()
+  })
+
+  it("shows draft intake when no draft target is available", async () => {
+    window.history.replaceState({}, "", "/")
+    vi.stubGlobal("fetch", vi.fn())
+
+    render(<DraftReviewWorkbench />)
+
+    expect(screen.getByText("Review Queue")).toBeInTheDocument()
+    expect(screen.getByText("Evidence")).toBeInTheDocument()
+    expect(screen.getByRole("heading", { name: "Start a draft review" })).toBeInTheDocument()
+    expect(screen.getAllByText("No draft loaded").length).toBeGreaterThan(0)
+    expect(screen.getByText("Nothing to inspect")).toBeInTheDocument()
+    expect(screen.getByLabelText("Draft text")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Create draft" })).toBeDisabled()
+  })
+
+  it("creates a draft from pasted text and transitions into the persisted workbench", async () => {
+    window.history.replaceState({}, "", "/")
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const method = init?.method ?? "GET"
+      const url = String(input)
+
+      if (url.endsWith("/api/v1/drafts") && method === "POST") {
+        return jsonResponse({
+          draft_id: "draft-created",
+          matter_id: "matter-1",
+          title: "Breach of Contract",
+          assertion_count: 2,
+          claim_count: 2,
+        })
+      }
+
+      if (url.endsWith("/api/v1/drafts/draft-created/review-state") && method === "GET") {
+        return jsonResponse(
+          buildReviewStatePayload({
+            draft_id: "draft-created",
+            active_queue_claims: [
+              buildFlaggedClaim({
+                claim_id: "claim-created",
+                claim_text: "Doe failed to deliver the notice.",
+                verdict: "unverified",
+              }),
+            ],
+          }),
+        )
+      }
+
+      if (url.endsWith("/api/v1/claims/claim-created/review-history") && method === "GET") {
+        return jsonResponse(buildClaimHistoryPayload("claim-created", "Doe failed to deliver the notice."))
+      }
+
+      throw new Error(`Unhandled request: ${method} ${url}`)
+    })
+
+    vi.stubGlobal("fetch", fetchMock)
+
+    render(<DraftReviewWorkbench />)
+
+    await userEvent.type(screen.getByLabelText("Draft text"), "Breach of Contract\n\nDoe failed to deliver the notice.")
+    await userEvent.click(screen.getByRole("button", { name: "Create draft" }))
+
+    expect(await screen.findAllByText("Doe failed to deliver the notice.")).not.toHaveLength(0)
+    expect(window.location.search).toBe("?draftId=draft-created")
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) => String(input).endsWith("/api/v1/drafts") && init?.method === "POST",
+      ),
+    ).toBe(true)
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) =>
+          String(input).endsWith("/api/v1/drafts/draft-created/review-state") && (init?.method ?? "GET") === "GET",
+      ),
+    ).toBe(true)
+  })
+
+  it("shows a no-review state for a newly created draft with no persisted review run", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const method = init?.method ?? "GET"
+      const url = String(input)
+
+      if (url.endsWith("/api/v1/drafts/draft-1/review-state") && method === "GET") {
+        return jsonResponse(
+          buildReviewStatePayload({
+            freshness: {
+              state_source: "persisted_read",
+              has_persisted_review_runs: false,
+              last_review_run_at: null,
+              latest_review_run_id: null,
+              latest_review_run_status: null,
+              latest_decision_at: null,
+              has_decisions_after_latest_run: false,
+              latest_claim_verification_at: null,
+              latest_verification_run_id: null,
+              has_verification_activity_after_latest_run: false,
+              is_stale: false,
+            },
+            queue_state: {
+              draft_id: "draft-1",
+              total_flagged_claims: 0,
+              resolved_flagged_claims: 0,
+              remaining_flagged_claims: 0,
+              next_claim_id: null,
+            },
+            active_queue_claims: [],
+            resolved_claims: [],
+            latest_review_run: null,
+            previous_review_run: null,
+          }),
+        )
+      }
+
+      throw new Error(`Unhandled request: ${method} ${url}`)
+    })
+
+    vi.stubGlobal("fetch", fetchMock)
+
+    render(<DraftReviewWorkbench />)
+
+    expect(await screen.findByText("No review has been run yet")).toBeInTheDocument()
+    expect(screen.getByText("Click Run to analyze this draft.")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Run review" })).toBeInTheDocument()
   })
 
   it("hydrates from persisted review-state and renders freshness/history", async () => {
@@ -61,8 +187,10 @@ describe("DraftReviewWorkbench", () => {
     render(<DraftReviewWorkbench />)
 
     expect(await screen.findAllByText("Doe delivered the notice.")).not.toHaveLength(0)
-    expect(screen.getByText(/Last fresh run/i)).toBeInTheDocument()
+    expect(screen.getByText(/Last review run/i)).toBeInTheDocument()
     expect(screen.getByText(/1 unstable/i)).toBeInTheDocument()
+    expect(screen.getByText("Persisted state")).toBeInTheDocument()
+    expect(screen.getByText(/Viewing persisted queue state from the review run at/i)).toBeInTheDocument()
     expect(await screen.findByText(/Verification changed from/i)).toBeInTheDocument()
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost:8000/api/v1/drafts/draft-1/review-state",
@@ -75,6 +203,12 @@ describe("DraftReviewWorkbench", () => {
         ([input, init]) => String(input).endsWith("/api/v1/drafts/draft-1/review") && init?.method === "POST",
       ),
     ).toBe(false)
+  })
+
+  it("renders a neutral fallback badge for an unknown verdict", () => {
+    render(<VerdictBadge verdict={"no_run" as never} />)
+
+    expect(screen.getByText("Not reviewed")).toBeInTheDocument()
   })
 
   it("submits a decision, refreshes from server truth, and keeps resolved claims inspectable", async () => {
@@ -192,7 +326,7 @@ describe("DraftReviewWorkbench", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Submit" }))
 
     expect(await screen.findAllByText("Doe signed the contract.")).not.toHaveLength(0)
-    expect(await screen.findByText(/State changed after the last fresh run/i)).toBeInTheDocument()
+    expect((await screen.findAllByText(/Rerun recommended/i)).length).toBeGreaterThan(0)
 
     await userEvent.click(screen.getByRole("button", { name: /Doe delivered the notice\./i }))
     expect(await screen.findByText(/Resolved via/i)).toBeInTheDocument()
@@ -299,7 +433,9 @@ describe("DraftReviewWorkbench", () => {
     vi.stubGlobal("fetch", fetchMock)
 
     const firstRender = render(<DraftReviewWorkbench />)
-    expect(await screen.findByText(/No persisted review run yet/i)).toBeInTheDocument()
+    expect(await screen.findByText(/No fresh review run has been recorded yet/i)).toBeInTheDocument()
+    expect(screen.getByText("No fresh run")).toBeInTheDocument()
+    expect(screen.getByText(/Run review to analyze this draft/i)).toBeInTheDocument()
     await userEvent.click(screen.getByRole("button", { name: "Run" }))
 
     await waitFor(() =>
@@ -313,7 +449,8 @@ describe("DraftReviewWorkbench", () => {
     firstRender.unmount()
 
     render(<DraftReviewWorkbench />)
-    expect(await screen.findByText(/Last fresh run/i)).toBeInTheDocument()
+    expect(await screen.findByText(/Last review run/i)).toBeInTheDocument()
+    expect(screen.getByText("Persisted state")).toBeInTheDocument()
     expect(await screen.findAllByText("Doe delivered the notice.")).not.toHaveLength(0)
   })
 })

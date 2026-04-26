@@ -43,8 +43,20 @@ const verdictConfig: Record<
   },
 }
 
-export function VerdictBadge({ verdict, className }: { verdict: ReviewVerdict; className?: string }) {
-  const config = verdictConfig[verdict]
+const fallbackVerdictConfig = {
+  label: "Not reviewed",
+  icon: CircleDashed,
+  className: "bg-muted text-muted-foreground",
+}
+
+export function VerdictBadge({
+  verdict,
+  className,
+}: {
+  verdict: ReviewVerdict | string | null | undefined
+  className?: string
+}) {
+  const config = verdict != null ? verdictConfig[verdict as ReviewVerdict] ?? fallbackVerdictConfig : fallbackVerdictConfig
   const Icon = config.icon
   return (
     <span className={cn("inline-flex items-center gap-1 rounded-sm px-1.5 py-0.5 text-[10px] font-semibold", config.className, className)}>

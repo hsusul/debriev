@@ -39,22 +39,23 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("evidence_bundle_id", "source_document_id"),
     )
 
-    op.add_column("drafts", sa.Column("evidence_bundle_id", sa.Uuid(), nullable=True))
-    op.create_index("ix_drafts_evidence_bundle_id", "drafts", ["evidence_bundle_id"])
-    op.create_foreign_key(
-        "fk_drafts_evidence_bundle_id_evidence_bundles",
-        "drafts",
-        "evidence_bundles",
-        ["evidence_bundle_id"],
-        ["id"],
-        ondelete="SET NULL",
-    )
+    with op.batch_alter_table("drafts") as batch_op:
+        batch_op.add_column(sa.Column("evidence_bundle_id", sa.Uuid(), nullable=True))
+        batch_op.create_index("ix_drafts_evidence_bundle_id", ["evidence_bundle_id"])
+        batch_op.create_foreign_key(
+            "fk_drafts_evidence_bundle_id_evidence_bundles",
+            "evidence_bundles",
+            ["evidence_bundle_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
 
 
 def downgrade() -> None:
-    op.drop_constraint("fk_drafts_evidence_bundle_id_evidence_bundles", "drafts", type_="foreignkey")
-    op.drop_index("ix_drafts_evidence_bundle_id", table_name="drafts")
-    op.drop_column("drafts", "evidence_bundle_id")
+    with op.batch_alter_table("drafts") as batch_op:
+        batch_op.drop_constraint("fk_drafts_evidence_bundle_id_evidence_bundles", type_="foreignkey")
+        batch_op.drop_index("ix_drafts_evidence_bundle_id")
+        batch_op.drop_column("evidence_bundle_id")
 
     op.drop_table("evidence_bundle_source_documents")
 

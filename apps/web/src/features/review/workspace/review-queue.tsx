@@ -24,6 +24,7 @@ export type QueueSection = {
 }
 
 export function ReviewQueue({
+  noDraftLoaded = false,
   queueSections,
   resolutionStateById,
   selectedClaimId,
@@ -45,6 +46,7 @@ export function ReviewQueue({
   onQueueOrderModeChange,
   onRerun,
 }: {
+  noDraftLoaded?: boolean
   queueSections: QueueSection[]
   resolutionStateById: Record<string, ResolutionActionState>
   selectedClaimId: string
@@ -67,6 +69,24 @@ export function ReviewQueue({
   onRerun: () => void
 }) {
   const hasPersistedRuns = freshness?.hasPersistedReviewRuns ?? false
+  const stateSourceLabel =
+    freshness == null
+      ? null
+      : freshness.hasPersistedReviewRuns
+        ? freshness.stateSource === "fresh_execution"
+          ? "Fresh execution"
+          : "Persisted state"
+        : "No fresh run"
+  const runStatusText = buildRunStatusText({
+    noDraftLoaded,
+    isHydrating,
+    freshness,
+    latestReviewRun,
+  })
+  const rerunRecommendation = buildRerunRecommendation({
+    freshness,
+    isRerunning,
+  })
 
   return (
     <div className="flex h-full flex-col">
@@ -74,50 +94,60 @@ export function ReviewQueue({
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h2 className="text-[13px] font-semibold tracking-tight text-foreground/90">Review Queue</h2>
-            <div className="mt-1 text-[11px] text-muted-foreground/55">
-              {isHydrating
-                ? "Loading persisted review state."
-                : hasPersistedRuns
-                  ? `Last fresh run ${formatTimestamp(freshness?.lastReviewRunAt)}`
-                  : "No persisted review run yet"}
+            <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
+              {stateSourceLabel ? (
+                <span className="rounded-sm border border-border/20 bg-surface-2/35 px-1.5 py-0.5 text-muted-foreground/70">
+                  {stateSourceLabel}
+                </span>
+              ) : null}
+              {freshness?.latestReviewRunStatus ? (
+                <span className="text-muted-foreground/45">{freshness.latestReviewRunStatus.toLowerCase()}</span>
+              ) : null}
+              {rerunRecommendation ? (
+                <span className="text-muted-foreground/55">{rerunRecommendation}</span>
+              ) : null}
             </div>
-            {freshness?.isStale ? (
-              <div className="mt-1 text-[10px] text-muted-foreground/45">
-                State changed after the last fresh run.
-              </div>
-            ) : null}
+            <div className="mt-1 text-[11px] text-muted-foreground/55">{runStatusText}</div>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[11px] font-mono text-muted-foreground/50">
-              {visibleClaimCount > 0 ? `${selectedIndex + 1}/${visibleClaimCount}` : "—"}
-            </span>
+            {visibleClaimCount > 0 ? (
+              <span className="text-[11px] font-mono text-muted-foreground/50">
+                {selectedIndex + 1}/{visibleClaimCount}
+              </span>
+            ) : null}
             <Button
               type="button"
               variant="ghost"
               size="sm"
               className="h-7 px-2.5 text-[11px]"
-              disabled={isHydrating || isRerunning}
+              disabled={noDraftLoaded || isHydrating || isRerunning}
               onClick={onRerun}
             >
               <RotateCw className={cn("mr-1.5 h-3 w-3", isRerunning && "animate-spin")} />
-              {hasPersistedRuns ? "Rerun" : "Run"}
+              {isRerunning ? "Refreshing" : hasPersistedRuns ? "Rerun" : "Run"}
             </Button>
           </div>
         </div>
 
         {latestReviewRun ? (
           <div className="mt-3 border-t border-border/15 pt-3 text-[10px] text-muted-foreground/45">
-            <div>
-              {latestReviewRun.remainingFlaggedClaims} active · {latestReviewRun.resolvedFlaggedClaims} resolved
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span>
+                {latestReviewRun.remainingFlaggedClaims} active · {latestReviewRun.resolvedFlaggedClaims} resolved
+              </span>
+              {previousReviewRun ? <span>Previous run {formatTimestamp(previousReviewRun.createdAt)}</span> : null}
+              {intelligenceSummary ? (
+                <span>
+                  {intelligenceSummary.mostUnstableClaimIds.length} unstable ·{" "}
+                  {intelligenceSummary.contradictionClaimIds.length} contradiction-linked
+                </span>
+              ) : null}
             </div>
-            {previousReviewRun ? (
-              <div className="mt-1">Previous run {formatTimestamp(previousReviewRun.createdAt)}</div>
+            {freshness?.latestDecisionAt ? (
+              <div className="mt-1">Latest reviewer action {formatTimestamp(freshness.latestDecisionAt)}</div>
             ) : null}
-            {intelligenceSummary ? (
-              <div className="mt-1">
-                {intelligenceSummary.mostUnstableClaimIds.length} unstable ·{" "}
-                {intelligenceSummary.contradictionClaimIds.length} contradiction-linked
-              </div>
+            {freshness?.latestClaimVerificationAt && freshness.latestClaimVerificationAt !== freshness.lastReviewRunAt ? (
+              <div className="mt-1">Latest verification activity {formatTimestamp(freshness.latestClaimVerificationAt)}</div>
             ) : null}
           </div>
         ) : null}
@@ -125,6 +155,7 @@ export function ReviewQueue({
         <div className="mt-3">
           <DenseSegmentedControl
             value={queueOrderMode}
+            disabled={noDraftLoaded}
             options={[
               { value: "severity" as QueueOrderMode, label: "By severity" },
               { value: "draft" as QueueOrderMode, label: "By draft" },
@@ -137,24 +168,31 @@ export function ReviewQueue({
           <FilterChip
             label="All"
             active={verdictFilter === "all"}
+            disabled={noDraftLoaded}
             onClick={() => onFilterChange("all")}
           />
           <FilterChip
             label="Bad"
             count={verdictCounts.unsupported}
             active={verdictFilter === "unsupported"}
+            disabled={noDraftLoaded}
+            title="Unsupported or likely unsupported claims"
             onClick={() => onFilterChange("unsupported")}
           />
           <FilterChip
             label="Over"
             count={verdictCounts.overstated}
             active={verdictFilter === "overstated"}
+            disabled={noDraftLoaded}
+            title="Overstated claims"
             onClick={() => onFilterChange("overstated")}
           />
           <FilterChip
             label="Amb"
             count={verdictCounts.ambiguous}
             active={verdictFilter === "ambiguous"}
+            disabled={noDraftLoaded}
+            title="Ambiguous claims"
             onClick={() => onFilterChange("ambiguous")}
           />
         </div>
@@ -162,7 +200,9 @@ export function ReviewQueue({
 
       <ScrollArea className="flex-1">
         <div className="px-2 py-2">
-          {queueSections.length === 0 ? (
+          {noDraftLoaded ? (
+            <QueueIdleState />
+          ) : queueSections.length === 0 ? (
             <QueueEmptyState
               filterActive={verdictFilter !== "all"}
               onClearFilter={() => onFilterChange("all")}
@@ -264,18 +304,21 @@ export function ReviewQueue({
 function DenseSegmentedControl<T extends string>({
   value,
   options,
+  disabled = false,
   onChange,
 }: {
   value: T
   options: { value: T; label: string }[]
+  disabled?: boolean
   onChange: (value: T) => void
 }) {
   return (
-    <div className="inline-flex rounded-md border border-border/30 bg-surface-2/50 p-0.5">
+    <div className={cn("inline-flex rounded-md border border-border/30 bg-surface-2/50 p-0.5", disabled && "opacity-50")}>
       {options.map((option) => (
         <button
           key={option.value}
           type="button"
+          disabled={disabled}
           className={cn(
             "rounded-sm px-3 py-1 text-[11px] font-medium transition-colors duration-100",
             value === option.value
@@ -295,18 +338,25 @@ function FilterChip({
   label,
   count,
   active,
+  disabled = false,
+  title,
   onClick,
 }: {
   label: string
   count?: number
   active: boolean
+  disabled?: boolean
+  title?: string
   onClick: () => void
 }) {
   return (
     <button
       type="button"
+      disabled={disabled}
+      title={title}
+      aria-label={title ?? label}
       className={cn(
-        "rounded-sm px-2 py-1 text-[11px] font-medium transition-colors duration-100",
+        "rounded-sm px-2 py-1 text-[11px] font-medium transition-colors duration-100 disabled:pointer-events-none disabled:opacity-50",
         active
           ? "bg-surface-3 text-foreground"
           : "text-muted-foreground/60 hover:bg-surface-2/40 hover:text-muted-foreground",
@@ -320,6 +370,19 @@ function FilterChip({
         </span>
       ) : null}
     </button>
+  )
+}
+
+function QueueIdleState() {
+  return (
+    <div className="px-3 py-5">
+      <div className="rounded-md border border-border/15 bg-surface-2/35 px-3 py-3">
+        <div className="text-[12px] font-medium text-muted-foreground/68">No draft loaded</div>
+        <div className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground/48">
+          Create a draft in the reader pane to populate the review queue.
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -383,6 +446,54 @@ function formatActionLabel(action: ResolvedClaimListItem["action"]) {
     case "resolve_with_edit":
       return "Edited"
   }
+}
+
+function buildRunStatusText({
+  noDraftLoaded,
+  isHydrating,
+  freshness,
+  latestReviewRun,
+}: {
+  noDraftLoaded: boolean
+  isHydrating: boolean
+  freshness: DraftReviewFreshness | null
+  latestReviewRun: DraftReviewRunSummary | null
+}) {
+  if (noDraftLoaded) {
+    return "No draft loaded"
+  }
+  if (isHydrating) {
+    return "Loading persisted review state."
+  }
+  if (freshness == null || !freshness.hasPersistedReviewRuns || latestReviewRun == null) {
+    return "No fresh review run has been recorded yet."
+  }
+  return `Last review run ${formatTimestamp(latestReviewRun.createdAt)}`
+}
+
+function buildRerunRecommendation({
+  freshness,
+  isRerunning,
+}: {
+  freshness: DraftReviewFreshness | null
+  isRerunning: boolean
+}) {
+  if (isRerunning) {
+    return "Refreshing review now"
+  }
+  if (freshness == null) {
+    return null
+  }
+  if (!freshness.hasPersistedReviewRuns) {
+    return "Run review to analyze this draft"
+  }
+  if (freshness.isStale) {
+    return "Rerun recommended"
+  }
+  if (freshness.stateSource === "persisted_read") {
+    return "Loaded from persisted queue"
+  }
+  return null
 }
 
 function formatTimestamp(value: string | null | undefined) {

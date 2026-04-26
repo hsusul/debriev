@@ -17,6 +17,8 @@ from app.services.verification.evidence_roles import (
 TOKEN_RE = re.compile(r"[a-z0-9']+")
 QUOTE_RE = re.compile(r'"([^"\n]+)"|“([^”\n]+)”')
 PROPER_TOKEN_RE = re.compile(r"\b[A-Z][a-z]{2,}\b")
+CASE_CITATION_RE = re.compile(r"\bv\.\s+[A-Z]")
+STRONG_UNIVERSAL_RE = re.compile(r"\b(always|all|must)\b")
 ABSOLUTE_QUALIFIERS = {"always", "never", "all", "only", "entirely", "completely", "every", "none"}
 KNOWLEDGE_MARKERS = ("knew", "should have known", "understood", "aware", "intended")
 CAUSATION_MARKERS = ("caused", "because", "due to", "resulted in", "led to")
@@ -111,13 +113,7 @@ def evaluate_heuristics(
     suggested_fix: str | None = None
 
     if not linked_links:
-        return HeuristicAssessment(
-            flags=["missing_citation"],
-            verdict=SupportStatus.UNVERIFIED,
-            reasoning=["No support links are attached to this claim."],
-            suggested_fix="Attach at least one anchored record segment before verification.",
-            confidence_score=0.15,
-        )
+        return _assess_claim_without_support_links(claim)
 
     invalid_anchor_count = sum(1 for segment in linked_segments if _has_invalid_anchor(segment))
     if invalid_anchor_count:
@@ -230,6 +226,37 @@ def _has_invalid_anchor(segment: Segment) -> bool:
     return not segment.has_usable_anchor
 
 
+def _assess_claim_without_support_links(claim: ClaimUnit) -> HeuristicAssessment:
+    flags = ["missing_citation"]
+    claim_text = claim.text
+
+    if CASE_CITATION_RE.search(claim_text):
+        return HeuristicAssessment(
+            flags=flags,
+            verdict=SupportStatus.AMBIGUOUS,
+            reasoning=["Citation present but no verified authority."],
+            suggested_fix="Attach anchored authority support for the cited proposition.",
+            confidence_score=0.65,
+        )
+
+    if STRONG_UNIVERSAL_RE.search(normalize_for_match(claim_text)):
+        return HeuristicAssessment(
+            flags=flags + ["absolute_qualifier_mismatch"],
+            verdict=SupportStatus.OVERSTATED,
+            reasoning=["Strong universal language appears without verified authority support."],
+            suggested_fix="Narrow the universal language or attach anchored authority support.",
+            confidence_score=0.8,
+        )
+
+    return HeuristicAssessment(
+        flags=flags,
+        verdict=SupportStatus.UNSUPPORTED,
+        reasoning=["No citation or verified authority supports this claim."],
+        suggested_fix="Attach at least one anchored authority or record segment before verification.",
+        confidence_score=0.75,
+    )
+
+
 def _lexical_overlap(claim_text: str, combined_text: str) -> float:
     claim_tokens = {token for token in TOKEN_RE.findall(claim_text) if token not in STOPWORDS}
     combined_tokens = {token for token in TOKEN_RE.findall(combined_text) if token not in STOPWORDS}
@@ -246,8 +273,6 @@ def _support_overlap_for_segment(claim_text: str, segment: Segment) -> float:
 
 
 def _derive_verdict(flags: list[str], overlap: float, *, all_substantive_support_weak: bool = False) -> SupportStatus:
-    if "missing_citation" in flags:
-        return SupportStatus.UNVERIFIED
     if "invalid_anchor" in flags:
         return SupportStatus.AMBIGUOUS
     if "quote_mismatch_placeholder" in flags:

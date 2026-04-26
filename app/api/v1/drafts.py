@@ -11,7 +11,17 @@ from app.repositories.claims import ClaimsRepository
 from app.repositories.drafts import DraftRepository
 from app.repositories.matters import MatterRepository
 from app.repositories.review_decisions import ClaimReviewDecisionRepository
-from app.schemas.draft import DraftCreate, DraftRead
+from app.schemas.citation_verification import (
+    CitationAuthorityStatusCountsRead,
+    CitationMatchedAuthorityRead,
+    CitationParsedAuthorityRead,
+    CitationVerificationItemRead,
+    CitationVerificationRequest,
+    CitationVerificationResultRead,
+    CitationVerificationSummaryRead,
+    CitationVerdictCountsRead,
+)
+from app.schemas.draft import DraftCreate, DraftRead, DraftTextCreate, DraftTextCreateRead
 from app.schemas.draft_workflow import (
     DraftClaimChangeSummaryRead,
     DraftClaimRelationshipRead,
@@ -60,6 +70,8 @@ from app.services.workflows.draft_review import (
     DraftReviewResult,
     DraftReviewService,
 )
+from app.services.workflows.draft_intake import DraftIntakeService
+from app.services.workflows.citation_verification import CitationVerificationResult, CitationVerificationService
 from app.services.workflows.reextract_claims import (
     DraftReExtractionApplyItem,
     DraftReExtractionApplyResult,
@@ -69,6 +81,32 @@ from app.services.workflows.reextract_claims import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["drafts"])
+
+
+@router.post("/citation-verification", response_model=CitationVerificationResultRead, status_code=status.HTTP_201_CREATED)
+def verify_citations(
+    payload: CitationVerificationRequest,
+    db: Session = Depends(get_db_session),
+):
+    result = CitationVerificationService(db).verify_draft_text(payload)
+    db.commit()
+    return _build_citation_verification_response(result)
+
+
+@router.post("/drafts", response_model=DraftTextCreateRead, status_code=status.HTTP_201_CREATED)
+def create_draft_from_text(
+    payload: DraftTextCreate,
+    db: Session = Depends(get_db_session),
+):
+    result = DraftIntakeService(db).create_draft_from_text(payload)
+    db.commit()
+    return DraftTextCreateRead(
+        draft_id=result.draft_id,
+        matter_id=result.matter_id,
+        title=result.title,
+        assertion_count=result.assertion_count,
+        claim_count=result.claim_count,
+    )
 
 
 @router.post("/matters/{matter_id}/drafts", response_model=DraftRead, status_code=status.HTTP_201_CREATED)
@@ -147,6 +185,91 @@ def _build_compile_response(result: DraftCompileResult) -> DraftCompileResultRea
         total_claims=result.total_claims,
         verdict_counts=_build_verdict_counts_response(result.counts),
         flagged_claims=[_build_flagged_claim_response(claim) for claim in result.flagged_claims],
+    )
+
+
+def _build_citation_verification_response(
+    result: CitationVerificationResult,
+) -> CitationVerificationResultRead:
+    return CitationVerificationResultRead(
+        draft_id=result.draft_id,
+        matter_id=result.matter_id,
+        title=result.title,
+        review_run_id=result.review_run_id,
+        reviewed_at=result.reviewed_at,
+        summary=CitationVerificationSummaryRead(
+            total_claims=result.summary.total_claims,
+            total_cited_propositions=result.summary.total_cited_propositions,
+            flagged_citation_count=result.summary.flagged_citation_count,
+            verdict_counts=CitationVerdictCountsRead(
+                supported=result.summary.verdict_counts.supported,
+                partially_supported=result.summary.verdict_counts.partially_supported,
+                overstated=result.summary.verdict_counts.overstated,
+                ambiguous=result.summary.verdict_counts.ambiguous,
+                unsupported=result.summary.verdict_counts.unsupported,
+                unverified=result.summary.verdict_counts.unverified,
+                contradicted=result.summary.verdict_counts.contradicted,
+            ),
+            authority_status_counts=CitationAuthorityStatusCountsRead(
+                authority_unverified=result.summary.authority_status_counts.authority_unverified,
+                citation_recognized=result.summary.authority_status_counts.citation_recognized,
+                authority_candidate_parsed=result.summary.authority_status_counts.authority_candidate_parsed,
+                authority_matched=result.summary.authority_status_counts.authority_matched,
+                linked_authority_support_present=(
+                    result.summary.authority_status_counts.linked_authority_support_present
+                ),
+                not_reviewed=result.summary.authority_status_counts.not_reviewed,
+            ),
+        ),
+        citations=[
+            CitationVerificationItemRead(
+                claim_id=item.claim_id,
+                draft_sequence=item.draft_sequence,
+                citation_text=item.citation_text,
+                proposition_text=item.proposition_text,
+                assertion_context=item.assertion_context,
+                authority_status=item.authority_status,
+                authority_match_status=item.authority_match_status,
+                parsed_authority=(
+                    CitationParsedAuthorityRead(
+                        case_name=item.parsed_authority.case_name,
+                        reporter_volume=item.parsed_authority.reporter_volume,
+                        reporter_abbreviation=item.parsed_authority.reporter_abbreviation,
+                        first_page=item.parsed_authority.first_page,
+                        court=item.parsed_authority.court,
+                        year=item.parsed_authority.year,
+                    )
+                    if item.parsed_authority is not None
+                    else None
+                ),
+                normalized_authority_reference=item.normalized_authority_reference,
+                matched_authority=(
+                    CitationMatchedAuthorityRead(
+                        authority_id=item.matched_authority.authority_id,
+                        canonical_name=item.matched_authority.canonical_name,
+                        canonical_citation=item.matched_authority.canonical_citation,
+                        reporter_volume=item.matched_authority.reporter_volume,
+                        reporter_abbreviation=item.matched_authority.reporter_abbreviation,
+                        first_page=item.matched_authority.first_page,
+                        court=item.matched_authority.court,
+                        year=item.matched_authority.year,
+                        source_name=item.matched_authority.source_name,
+                    )
+                    if item.matched_authority is not None
+                    else None
+                ),
+                proposition_verdict=item.proposition_verdict,
+                reasoning=item.reasoning,
+                reasoning_categories=item.reasoning_categories,
+                confidence_score=item.confidence_score,
+                primary_anchor=item.primary_anchor,
+                support_snippet=item.support_snippet,
+                suggested_fix=item.suggested_fix,
+                verification_run_id=item.verification_run_id,
+                verified_at=item.verified_at,
+            )
+            for item in result.citations
+        ],
     )
 
 

@@ -48,13 +48,13 @@ def test_compile_draft_aggregates_mixed_verification_outcomes(
     assert result.counts.partially_supported == 0
     assert result.counts.overstated == 1
     assert result.counts.ambiguous == 1
-    assert result.counts.unsupported == 1
-    assert result.counts.unverified == 1
+    assert result.counts.unsupported == 2
+    assert result.counts.unverified == 0
     assert [claim.verdict for claim in result.flagged_claims] == [
         SupportStatus.OVERSTATED,
         SupportStatus.AMBIGUOUS,
         SupportStatus.UNSUPPORTED,
-        SupportStatus.UNVERIFIED,
+        SupportStatus.UNSUPPORTED,
     ]
     assert [claim.claim_text for claim in result.flagged_claims] == [
         "Doe reviewed the contract and approved the invoice.",

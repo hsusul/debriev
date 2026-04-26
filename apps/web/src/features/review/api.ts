@@ -1,6 +1,19 @@
 import type { ClaimReviewHistoryApiPayload, ReviewApiPayload } from "@/features/review/adapters"
 import type { ResolutionSubmissionRequest } from "@/features/review/types"
 
+interface CreateDraftRequest {
+  draftText: string
+  title?: string
+}
+
+interface CreateDraftResponse {
+  draft_id: string
+  matter_id: string
+  title: string
+  assertion_count: number
+  claim_count: number
+}
+
 interface ClaimDecisionMutationResponse {
   decision: {
     id: string
@@ -26,6 +39,22 @@ export function resolveDraftId() {
   }
 
   return null
+}
+
+export function setDraftIdInUrl(draftId: string) {
+  const url = new URL(window.location.href)
+  url.searchParams.set("draftId", draftId)
+  window.history.pushState({}, "", url)
+}
+
+export async function createDraft(payload: CreateDraftRequest): Promise<CreateDraftResponse> {
+  return requestJson<CreateDraftResponse>("/api/v1/drafts", {
+    method: "POST",
+    body: JSON.stringify({
+      draft_text: payload.draftText,
+      title: payload.title,
+    }),
+  })
 }
 
 export async function fetchDraftReviewState(draftId: string): Promise<ReviewApiPayload> {

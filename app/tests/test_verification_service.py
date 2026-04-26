@@ -200,7 +200,7 @@ def test_verification_service_surfaces_invalid_existing_links_when_no_valid_supp
     assert provider.last_request is None
     assert "missing_citation" in execution.result.deterministic_flags
     assert "out_of_scope_support_link" in execution.result.deterministic_flags
-    assert execution.result.verdict == SupportStatus.UNVERIFIED
+    assert execution.result.verdict == SupportStatus.UNSUPPORTED
     assert execution.result.primary_anchor is None
     assert execution.result.support_assessments == []
     assert "No valid support links remain after excluding invalid existing links." in execution.result.reasoning

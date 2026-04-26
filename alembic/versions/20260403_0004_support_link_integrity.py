@@ -15,16 +15,16 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_unique_constraint(
-        "uq_support_links_claim_unit_segment",
-        "support_links",
-        ["claim_unit_id", "segment_id"],
-    )
+    with op.batch_alter_table("support_links") as batch_op:
+        batch_op.create_unique_constraint(
+            "uq_support_links_claim_unit_segment",
+            ["claim_unit_id", "segment_id"],
+        )
 
 
 def downgrade() -> None:
-    op.drop_constraint(
-        "uq_support_links_claim_unit_segment",
-        "support_links",
-        type_="unique",
-    )
+    with op.batch_alter_table("support_links") as batch_op:
+        batch_op.drop_constraint(
+            "uq_support_links_claim_unit_segment",
+            type_="unique",
+        )

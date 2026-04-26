@@ -142,7 +142,7 @@ class VerificationClassifier:
 
         provider = self._build_provider(model_version=resolved_model_version)
         if provider is None:
-            reasoning_parts.append("No LLM provider configured; returning deterministic placeholder output.")
+            reasoning_parts.append("No LLM provider configured; returning deterministic verification output.")
         elif self._has_blocking_flags(heuristic.flags):
             reasoning_parts.append("Blocking deterministic flags prevent provider refinement for this claim.")
         else:

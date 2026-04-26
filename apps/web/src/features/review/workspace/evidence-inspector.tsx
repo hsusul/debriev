@@ -6,10 +6,12 @@ import type { ClaimReviewHistory, SelectedClaimDetail } from "@/features/review/
 import { cn } from "@/lib/utils"
 
 export function EvidenceInspector({
+  noDraftLoaded = false,
   claim,
   claimHistory,
   isLoading,
 }: {
+  noDraftLoaded?: boolean
   claim: SelectedClaimDetail | null
   claimHistory: ClaimReviewHistory | null
   isLoading: boolean
@@ -25,7 +27,9 @@ export function EvidenceInspector({
             <FileSearch className="mx-auto mb-3 h-5 w-5 text-muted-foreground/30" />
             <div className="text-[12px] font-medium text-muted-foreground/60">Nothing to inspect</div>
             <div className="mt-1.5 text-[11px] leading-relaxed text-muted-foreground/40">
-              Select a claim from the queue to view support evidence.
+              {noDraftLoaded
+                ? "Create a draft to inspect claims and support evidence."
+                : "Select a claim from the queue to view support evidence."}
             </div>
           </div>
         </div>
