@@ -1,5 +1,5 @@
-import { DraftReviewWorkbench } from "@/features/review/draft-review-workbench"
+import { MvpDemoApp } from "@/features/mvp-demo/mvp-demo-app"
 
 export default function App() {
-  return <DraftReviewWorkbench />
+  return <MvpDemoApp />
 }

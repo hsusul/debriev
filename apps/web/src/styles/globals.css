@@ -6,36 +6,36 @@
   color-scheme: dark;
 
   /* Layered dark surface system: 0 → 1 → 2 → 3 */
-  --background: 0 0% 5.5%;        /* #0e0e0e - deepest base */
-  --foreground: 0 0% 93%;         /* #ededed - high contrast text */
+  --background: 30 8% 5.5%;       /* warm off-black base */
+  --foreground: 36 14% 91%;       /* warm high contrast text */
 
-  --surface-0: 0 0% 5.5%;         /* same as background */
-  --surface-1: 0 0% 8%;           /* #141414 - panels, sidebars */
-  --surface-2: 0 0% 10.5%;        /* #1a1a1a - cards, sections */
-  --surface-3: 0 0% 13%;          /* #212121 - elevated elements */
+  --surface-0: 30 8% 4.8%;
+  --surface-1: 30 8% 7.5%;
+  --surface-2: 30 7% 10%;
+  --surface-3: 30 6% 13%;
 
-  --card: 0 0% 8%;
-  --card-foreground: 0 0% 93%;
-  --popover: 0 0% 10%;
-  --popover-foreground: 0 0% 93%;
+  --card: 30 8% 7.5%;
+  --card-foreground: 36 14% 91%;
+  --popover: 30 7% 10%;
+  --popover-foreground: 36 14% 91%;
 
-  --primary: 0 0% 93%;
-  --primary-foreground: 0 0% 5.5%;
-  --secondary: 0 0% 12%;
-  --secondary-foreground: 0 0% 93%;
+  --primary: 36 14% 91%;
+  --primary-foreground: 30 8% 5.5%;
+  --secondary: 30 7% 12%;
+  --secondary-foreground: 36 14% 91%;
 
-  --muted: 0 0% 12%;
-  --muted-foreground: 0 0% 55%;
+  --muted: 30 7% 12%;
+  --muted-foreground: 35 7% 58%;
 
-  --accent: 0 0% 14%;
-  --accent-foreground: 0 0% 93%;
+  --accent: 36 18% 16%;
+  --accent-foreground: 36 14% 91%;
 
   --destructive: 0 62% 35%;
   --destructive-foreground: 0 0% 93%;
 
-  --border: 0 0% 14%;
-  --input: 0 0% 14%;
-  --ring: 0 0% 30%;
+  --border: 30 6% 15%;
+  --input: 30 6% 15%;
+  --ring: 36 12% 34%;
 
   /* Verdict colors: desaturated for dark mode legibility */
   --verdict-supported: 152 40% 48%;
@@ -60,6 +60,7 @@ body,
 
 body {
   @apply bg-background font-sans text-foreground antialiased;
+  letter-spacing: -0.01em;
 }
 
 button,
@@ -69,8 +70,24 @@ textarea {
 }
 
 ::selection {
-  background: hsl(var(--accent) / 0.3);
+  background: hsl(38 36% 34% / 0.35);
   color: hsl(var(--foreground));
+}
+
+.debriev-backdrop {
+  position: relative;
+  isolation: isolate;
+}
+
+.debriev-backdrop::before {
+  background-image:
+    radial-gradient(circle at 50% -12rem, hsl(34 16% 15% / 0.48), transparent 34rem),
+    linear-gradient(180deg, hsl(var(--background)), hsl(30 8% 4.5%));
+  content: "";
+  inset: 0;
+  pointer-events: none;
+  position: fixed;
+  z-index: -1;
 }
 
 /* Scrollbar styling for dark mode */

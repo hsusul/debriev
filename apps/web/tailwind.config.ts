@@ -6,9 +6,9 @@ const config: Config = {
   theme: {
     extend: {
       fontFamily: {
-        sans: ['"Inter"', '"Avenir Next"', "sans-serif"],
-        serif: ['"Iowan Old Style"', '"Source Serif Pro"', "serif"],
-        mono: ['"IBM Plex Mono"', "monospace"],
+        sans: ['"SF Pro Display"', '"Geist Sans"', '"Avenir Next"', '"Helvetica Neue"', "sans-serif"],
+        serif: ['"Iowan Old Style"', '"Newsreader"', '"Source Serif Pro"', "serif"],
+        mono: ['"Geist Mono"', '"SF Mono"', '"IBM Plex Mono"', "monospace"],
       },
       colors: {
         background: "hsl(var(--background) / <alpha-value>)",

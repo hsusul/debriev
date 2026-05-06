@@ -16,6 +16,9 @@ Debriev’s MVP is a citation verification system, not a broad legal IDE.
 - `POST /api/v1/citation-verification`
   - Input: draft text
   - Behavior: create draft, extract claims, run fresh verification, return only citation-level results plus a draft summary
+- `POST /api/v1/case-pdf-verification`
+  - Input: one uploaded case PDF, one statement to verify, optional citation text
+  - Behavior: extract text from a text-based PDF, derive best-effort authority metadata, compare optional citation text to the PDF, and return whether the statement appears supported by the extracted opinion text
 - Existing routes still exist, but they are no longer the primary demo surface for MVP:
   - `POST /api/v1/drafts`
   - `POST /api/v1/drafts/{draft_id}/review`
@@ -50,11 +53,11 @@ These systems are still useful infrastructure. They should remain in the repo fo
 
 ## Honest capability boundary
 
-The current backend can classify cited propositions, parse ordinary case-citation structure deterministically, and match a limited set of authorities against a small built-in MVP catalog.
+The current backend can classify cited propositions, parse ordinary case-citation structure deterministically, match a limited set of authorities against a small built-in MVP catalog, verify some propositions against a narrow built-in authority-content catalog, and verify one uploaded text-based case PDF against one statement at a time.
 
-It does **not** yet do full court-authority identity resolution against a comprehensive authority database.
+It does **not** yet do full court-authority identity resolution against a comprehensive authority database, it does **not** yet verify propositions against broad real-world opinion coverage, and it does **not** yet solve OCR or scanned-PDF extraction.
 
-For MVP, the product should expose that boundary honestly through `authority_status`, parsed authority fields, and match results rather than overclaiming broad case verification coverage.
+For MVP, the product should expose that boundary honestly through `authority_status`, `authority_content_status`, parsed authority fields, match results, PDF extraction status, and authority excerpts rather than overclaiming broad case verification coverage.
 
 ## Smallest frontend surface for MVP
 

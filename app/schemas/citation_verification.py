@@ -32,12 +32,20 @@ class CitationAuthorityStatusCountsRead(BaseModel):
     not_reviewed: int
 
 
+class CitationAuthorityContentStatusCountsRead(BaseModel):
+    not_applicable: int
+    unavailable: int
+    available: int
+    support_verified: int
+
+
 class CitationVerificationSummaryRead(BaseModel):
     total_claims: int
     total_cited_propositions: int
     flagged_citation_count: int
     verdict_counts: CitationVerdictCountsRead
     authority_status_counts: CitationAuthorityStatusCountsRead
+    authority_content_status_counts: CitationAuthorityContentStatusCountsRead
 
 
 class CitationParsedAuthorityRead(BaseModel):
@@ -45,8 +53,14 @@ class CitationParsedAuthorityRead(BaseModel):
     reporter_volume: str | None
     reporter_abbreviation: str | None
     first_page: str | None
+    pin_cite: str | None
     court: str | None
     year: int | None
+
+
+class CitationSourceSpanRead(BaseModel):
+    start: int
+    end: int
 
 
 class CitationMatchedAuthorityRead(BaseModel):
@@ -61,17 +75,39 @@ class CitationMatchedAuthorityRead(BaseModel):
     source_name: str
 
 
+class CitationExternalAuthorityRead(BaseModel):
+    provider: str
+    provider_cluster_id: str | None
+    case_name: str | None
+    canonical_citation: str | None
+    absolute_url: str | None
+    date_filed: str | None
+    year: int | None
+    normalized_citations: list[str]
+
+
 class CitationVerificationItemRead(BaseModel):
     claim_id: UUID
     draft_sequence: int
     citation_text: str
+    citation_span: CitationSourceSpanRead
+    citation_kind: str
+    citation_parse_status: str
     proposition_text: str
     assertion_context: str | None
     authority_status: str
     authority_match_status: str
+    authority_lookup_status: str
+    authority_lookup_provider: str | None
+    authority_lookup_error: str | None
+    authority_lookup_cached: bool
     parsed_authority: CitationParsedAuthorityRead | None
     normalized_authority_reference: str | None
     matched_authority: CitationMatchedAuthorityRead | None
+    external_authority: CitationExternalAuthorityRead | None
+    authority_content_status: str
+    authority_excerpt: str | None
+    support_verification_basis: str | None
     proposition_verdict: SupportStatus
     reasoning: str | None
     reasoning_categories: list[StructuredReasoningCategory]
@@ -91,3 +127,12 @@ class CitationVerificationResultRead(BaseModel):
     reviewed_at: datetime | None
     summary: CitationVerificationSummaryRead
     citations: list[CitationVerificationItemRead]
+
+
+class CitationVerificationPdfResultRead(BaseModel):
+    pdf_text_status: str
+    extracted_character_count: int
+    page_count: int | None
+    extraction_warnings: list[str]
+    extracted_text_preview: str | None
+    citation_verification: CitationVerificationResultRead | None

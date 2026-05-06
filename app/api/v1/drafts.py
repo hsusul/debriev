@@ -2,20 +2,24 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, File, Form, UploadFile, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_session
-from app.core.exceptions import NotFoundError
+from app.core.exceptions import NotFoundError, ValidationError
 from app.repositories.claims import ClaimsRepository
 from app.repositories.drafts import DraftRepository
 from app.repositories.matters import MatterRepository
 from app.repositories.review_decisions import ClaimReviewDecisionRepository
 from app.schemas.citation_verification import (
+    CitationAuthorityContentStatusCountsRead,
     CitationAuthorityStatusCountsRead,
+    CitationExternalAuthorityRead,
     CitationMatchedAuthorityRead,
     CitationParsedAuthorityRead,
+    CitationSourceSpanRead,
     CitationVerificationItemRead,
+    CitationVerificationPdfResultRead,
     CitationVerificationRequest,
     CitationVerificationResultRead,
     CitationVerificationSummaryRead,
@@ -72,6 +76,7 @@ from app.services.workflows.draft_review import (
 )
 from app.services.workflows.draft_intake import DraftIntakeService
 from app.services.workflows.citation_verification import CitationVerificationResult, CitationVerificationService
+from app.services.workflows.case_pdf_verification import ExtractedPdfText, extract_pdf_text
 from app.services.workflows.reextract_claims import (
     DraftReExtractionApplyItem,
     DraftReExtractionApplyResult,
@@ -91,6 +96,39 @@ def verify_citations(
     result = CitationVerificationService(db).verify_draft_text(payload)
     db.commit()
     return _build_citation_verification_response(result)
+
+
+@router.post(
+    "/citation-verification/pdf",
+    response_model=CitationVerificationPdfResultRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def verify_citations_from_pdf(
+    pdf_file: UploadFile = File(...),
+    title: str | None = Form(default=None),
+    db: Session = Depends(get_db_session),
+):
+    if pdf_file.filename is not None and not pdf_file.filename.lower().endswith(".pdf"):
+        raise ValidationError("Uploaded file must be a PDF.")
+
+    extracted_text = extract_pdf_text(await pdf_file.read())
+    if extracted_text.status != "text_extracted":
+        return _build_pdf_citation_verification_response(
+            extracted_text=extracted_text,
+            citation_result=None,
+        )
+
+    citation_result = CitationVerificationService(db).verify_draft_text(
+        CitationVerificationRequest(
+            draft_text=_prepare_pdf_draft_text(extracted_text.text),
+            title=title or _title_from_filename(pdf_file.filename),
+        )
+    )
+    db.commit()
+    return _build_pdf_citation_verification_response(
+        extracted_text=extracted_text,
+        citation_result=citation_result,
+    )
 
 
 @router.post("/drafts", response_model=DraftTextCreateRead, status_code=status.HTTP_201_CREATED)
@@ -220,22 +258,39 @@ def _build_citation_verification_response(
                 ),
                 not_reviewed=result.summary.authority_status_counts.not_reviewed,
             ),
+            authority_content_status_counts=CitationAuthorityContentStatusCountsRead(
+                not_applicable=result.summary.authority_content_status_counts.not_applicable,
+                unavailable=result.summary.authority_content_status_counts.unavailable,
+                available=result.summary.authority_content_status_counts.available,
+                support_verified=result.summary.authority_content_status_counts.support_verified,
+            ),
         ),
         citations=[
             CitationVerificationItemRead(
                 claim_id=item.claim_id,
                 draft_sequence=item.draft_sequence,
                 citation_text=item.citation_text,
+                citation_span=CitationSourceSpanRead(
+                    start=item.citation_span.start,
+                    end=item.citation_span.end,
+                ),
+                citation_kind=item.citation_kind,
+                citation_parse_status=item.citation_parse_status,
                 proposition_text=item.proposition_text,
                 assertion_context=item.assertion_context,
                 authority_status=item.authority_status,
                 authority_match_status=item.authority_match_status,
+                authority_lookup_status=item.authority_lookup_status,
+                authority_lookup_provider=item.authority_lookup_provider,
+                authority_lookup_error=item.authority_lookup_error,
+                authority_lookup_cached=item.authority_lookup_cached,
                 parsed_authority=(
                     CitationParsedAuthorityRead(
                         case_name=item.parsed_authority.case_name,
                         reporter_volume=item.parsed_authority.reporter_volume,
                         reporter_abbreviation=item.parsed_authority.reporter_abbreviation,
                         first_page=item.parsed_authority.first_page,
+                        pin_cite=item.parsed_authority.pin_cite,
                         court=item.parsed_authority.court,
                         year=item.parsed_authority.year,
                     )
@@ -258,6 +313,23 @@ def _build_citation_verification_response(
                     if item.matched_authority is not None
                     else None
                 ),
+                external_authority=(
+                    CitationExternalAuthorityRead(
+                        provider=item.external_authority.provider,
+                        provider_cluster_id=item.external_authority.provider_cluster_id,
+                        case_name=item.external_authority.case_name,
+                        canonical_citation=item.external_authority.canonical_citation,
+                        absolute_url=item.external_authority.absolute_url,
+                        date_filed=item.external_authority.date_filed,
+                        year=item.external_authority.year,
+                        normalized_citations=item.external_authority.normalized_citations,
+                    )
+                    if item.external_authority is not None
+                    else None
+                ),
+                authority_content_status=item.authority_content_status,
+                authority_excerpt=item.authority_excerpt,
+                support_verification_basis=item.support_verification_basis,
                 proposition_verdict=item.proposition_verdict,
                 reasoning=item.reasoning,
                 reasoning_categories=item.reasoning_categories,
@@ -271,6 +343,52 @@ def _build_citation_verification_response(
             for item in result.citations
         ],
     )
+
+
+def _build_pdf_citation_verification_response(
+    *,
+    extracted_text: ExtractedPdfText,
+    citation_result: CitationVerificationResult | None,
+) -> CitationVerificationPdfResultRead:
+    return CitationVerificationPdfResultRead(
+        pdf_text_status=extracted_text.status,
+        extracted_character_count=extracted_text.character_count,
+        page_count=extracted_text.page_count,
+        extraction_warnings=extracted_text.warnings or [],
+        extracted_text_preview=extracted_text.preview,
+        citation_verification=(
+            _build_citation_verification_response(citation_result)
+            if citation_result is not None
+            else None
+        ),
+    )
+
+
+def _title_from_filename(filename: str | None) -> str | None:
+    if filename is None:
+        return None
+    title = filename.rsplit("/", 1)[-1].rsplit(".", 1)[0].replace("_", " ").replace("-", " ").strip()
+    return title or None
+
+
+def _prepare_pdf_draft_text(text: str) -> str:
+    lines = text.splitlines()
+    if len(lines) < 2:
+        return text
+
+    first_line = lines[0].strip()
+    second_line = lines[1].strip()
+    if _looks_like_pdf_heading(first_line) and " v. " in second_line:
+        return "\n\n".join([first_line, "\n".join(lines[1:])])
+    return text
+
+
+def _looks_like_pdf_heading(line: str) -> bool:
+    if not line or len(line) > 80:
+        return False
+    if " v. " in line:
+        return False
+    return not any(mark in line for mark in ".;?!")
 
 
 def _build_review_response(result: DraftReviewResult) -> DraftReviewResultRead:

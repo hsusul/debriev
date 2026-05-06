@@ -25,10 +25,13 @@ class Settings(BaseSettings):
     verification_model_version: str = "heuristic-v1"
     prompt_version: str = "v1"
 
+    courtlistener_api_token: str | None = None
+    courtlistener_base_url: str = "https://www.courtlistener.com"
+    courtlistener_timeout_seconds: float = 8.0
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return a cached settings object."""
 
     return Settings()
-

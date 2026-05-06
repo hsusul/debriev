@@ -1,0 +1,1 @@
+"""Authority identity lookup adapters."""

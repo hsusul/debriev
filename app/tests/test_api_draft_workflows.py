@@ -140,7 +140,7 @@ def test_create_draft_from_text_creates_reviewable_draft(
     assert all(claim.support_status == SupportStatus.UNVERIFIED for claim in claims)
 
 
-def test_citation_verification_endpoint_surfaces_recognized_but_unresolved_partial_citation(
+def test_citation_verification_endpoint_does_not_expose_partial_case_reference_as_full_mvp_citation(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -165,33 +165,23 @@ def test_citation_verification_endpoint_surfaces_recognized_but_unresolved_parti
     assert payload["review_run_id"] is not None
     assert payload["reviewed_at"] is not None
     assert payload["summary"]["total_claims"] >= 2
-    assert payload["summary"]["total_cited_propositions"] == 1
-    assert payload["summary"]["flagged_citation_count"] == 1
-    assert payload["summary"]["verdict_counts"]["ambiguous"] == 1
-    assert payload["summary"]["authority_status_counts"]["authority_unverified"] == 1
-    assert payload["summary"]["authority_status_counts"]["citation_recognized"] == 1
+    assert payload["summary"]["total_cited_propositions"] == 0
+    assert payload["summary"]["flagged_citation_count"] == 0
+    assert all(count == 0 for count in payload["summary"]["verdict_counts"].values())
+    assert payload["summary"]["authority_status_counts"]["authority_unverified"] == 0
+    assert payload["summary"]["authority_status_counts"]["citation_recognized"] == 0
     assert payload["summary"]["authority_status_counts"]["authority_candidate_parsed"] == 0
     assert payload["summary"]["authority_status_counts"]["authority_matched"] == 0
-    assert [item["citation_text"] for item in payload["citations"]] == ["Smith v. Jones"]
-    assert payload["citations"][0]["proposition_text"] == "Under Smith v. Jones, Doe had to provide notice."
-    assert payload["citations"][0]["authority_status"] == "citation_recognized"
-    assert payload["citations"][0]["authority_match_status"] == "recognized_only"
-    assert payload["citations"][0]["parsed_authority"] == {
-        "case_name": "Smith v. Jones",
-        "reporter_volume": None,
-        "reporter_abbreviation": None,
-        "first_page": None,
-        "court": None,
-        "year": None,
+    assert payload["summary"]["authority_content_status_counts"] == {
+        "not_applicable": 0,
+        "unavailable": 0,
+        "available": 0,
+        "support_verified": 0,
     }
-    assert payload["citations"][0]["normalized_authority_reference"] == "smith v jones"
-    assert payload["citations"][0]["matched_authority"] is None
-    assert payload["citations"][0]["proposition_verdict"] == SupportStatus.AMBIGUOUS.value
-    assert payload["citations"][0]["reasoning"] is not None
-    assert payload["citations"][0]["support_snippet"] is None
+    assert payload["citations"] == []
 
 
-def test_citation_verification_endpoint_matches_known_authority_from_mvp_catalog(
+def test_citation_verification_endpoint_surfaces_matched_authority_with_content_unavailable(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -200,10 +190,7 @@ def test_citation_verification_endpoint_matches_known_authority_from_mvp_catalog
     response = client.post(
         "/api/v1/citation-verification",
         json={
-            "draft_text": (
-                "Brown v. Board of Education, 347 U.S. 483 (1954), held that segregation in public schools "
-                "violates equal protection."
-            ),
+            "draft_text": "Anderson v. Liberty Lobby, Inc., 477 U.S. 242 (1986), held that summary judgment always fails when facts are disputed.",
         },
     )
 
@@ -214,33 +201,70 @@ def test_citation_verification_endpoint_matches_known_authority_from_mvp_catalog
     assert payload["summary"]["verdict_counts"]["ambiguous"] == 1
     assert payload["summary"]["authority_status_counts"]["authority_unverified"] == 0
     assert payload["summary"]["authority_status_counts"]["authority_matched"] == 1
-    assert payload["citations"][0]["citation_text"] == "Brown v. Board of Education, 347 U.S. 483 (1954)"
+    assert payload["summary"]["authority_content_status_counts"] == {
+        "not_applicable": 0,
+        "unavailable": 1,
+        "available": 0,
+        "support_verified": 0,
+    }
+    assert payload["citations"][0]["citation_text"] == "Anderson v. Liberty Lobby, Inc., 477 U.S. 242 (1986)"
+    assert payload["citations"][0]["citation_span"] == {"start": 0, "end": 52}
+    assert payload["citations"][0]["citation_kind"] == "full_case"
+    assert payload["citations"][0]["citation_parse_status"] == "full_case_parsed"
     assert payload["citations"][0]["authority_status"] == "authority_matched"
     assert payload["citations"][0]["authority_match_status"] == "matched"
-    assert payload["citations"][0]["parsed_authority"] == {
-        "case_name": "Brown v. Board of Education",
-        "reporter_volume": "347",
-        "reporter_abbreviation": "U.S.",
-        "first_page": "483",
-        "court": None,
-        "year": 1954,
-    }
-    assert (
-        payload["citations"][0]["normalized_authority_reference"]
-        == "brown v board of education|347|u.s.|483|1954"
-    )
+    assert payload["citations"][0]["authority_content_status"] == "unavailable"
+    assert payload["citations"][0]["authority_excerpt"] is None
+    assert payload["citations"][0]["support_verification_basis"] == "authority_content_unavailable"
     assert payload["citations"][0]["matched_authority"] == {
-        "authority_id": "brown-v-board-of-education-347-us-483",
-        "canonical_name": "Brown v. Board of Education",
-        "canonical_citation": "Brown v. Board of Education, 347 U.S. 483 (1954)",
-        "reporter_volume": "347",
+        "authority_id": "anderson-v-liberty-lobby-477-us-242",
+        "canonical_name": "Anderson v. Liberty Lobby, Inc.",
+        "canonical_citation": "Anderson v. Liberty Lobby, Inc., 477 U.S. 242 (1986)",
+        "reporter_volume": "477",
         "reporter_abbreviation": "U.S.",
-        "first_page": "483",
+        "first_page": "242",
         "court": None,
-        "year": 1954,
+        "year": 1986,
         "source_name": "debriev_mvp_authority_catalog",
     }
     assert payload["citations"][0]["proposition_verdict"] == SupportStatus.AMBIGUOUS.value
+    assert "no authority content is available" in payload["citations"][0]["reasoning"]
+
+
+def test_citation_verification_endpoint_verifies_supported_proposition_against_authority_content(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_provider(monkeypatch, provider=None, api_key=None)
+
+    response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": (
+                "Brown v. Board of Education, 347 U.S. 483 (1954), held that segregation in public schools "
+                "deprives children of equal educational opportunities."
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["summary"]["total_cited_propositions"] == 1
+    assert payload["summary"]["flagged_citation_count"] == 0
+    assert payload["summary"]["verdict_counts"]["supported"] == 1
+    assert payload["summary"]["authority_status_counts"]["authority_matched"] == 1
+    assert payload["summary"]["authority_content_status_counts"] == {
+        "not_applicable": 0,
+        "unavailable": 0,
+        "available": 0,
+        "support_verified": 1,
+    }
+    assert payload["citations"][0]["authority_status"] == "authority_matched"
+    assert payload["citations"][0]["authority_content_status"] == "support_verified"
+    assert payload["citations"][0]["support_verification_basis"] == "authority_content_deterministic_supported"
+    assert payload["citations"][0]["proposition_verdict"] == SupportStatus.SUPPORTED.value
+    assert payload["citations"][0]["authority_excerpt"] is not None
+    assert "materially overlaps" in payload["citations"][0]["reasoning"]
 
 
 def test_citation_verification_endpoint_surfaces_parseable_but_unmatched_authority(
@@ -263,17 +287,141 @@ def test_citation_verification_endpoint_surfaces_parseable_but_unmatched_authori
     assert payload["summary"]["authority_status_counts"]["authority_candidate_parsed"] == 1
     assert payload["summary"]["authority_status_counts"]["citation_recognized"] == 0
     assert payload["summary"]["authority_status_counts"]["authority_matched"] == 0
+    assert payload["summary"]["authority_content_status_counts"] == {
+        "not_applicable": 1,
+        "unavailable": 0,
+        "available": 0,
+        "support_verified": 0,
+    }
     assert payload["citations"][0]["authority_status"] == "authority_candidate_parsed"
     assert payload["citations"][0]["authority_match_status"] == "no_match"
+    assert payload["citations"][0]["authority_content_status"] == "not_applicable"
     assert payload["citations"][0]["parsed_authority"] == {
         "case_name": "Brown v. Davis",
         "reporter_volume": "999",
         "reporter_abbreviation": "U.S.",
         "first_page": "1",
+        "pin_cite": None,
         "court": None,
         "year": 2001,
     }
     assert payload["citations"][0]["matched_authority"] is None
+
+
+def test_citation_verification_endpoint_uses_courtlistener_identity_lookup_when_configured(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_provider(monkeypatch, provider=None, api_key=None)
+    monkeypatch.setenv("COURTLISTENER_API_TOKEN", "test-token")
+    get_settings.cache_clear()
+    live_call_count = 0
+
+    def fake_lookup(**kwargs):
+        nonlocal live_call_count
+        live_call_count += 1
+        assert kwargs["data"] == {"volume": "410", "reporter": "U.S.", "page": "113"}
+        return [
+            {
+                "citation": "410 U.S. 113",
+                "normalized_citations": ["410 U.S. 113"],
+                "status": 200,
+                "error_message": "",
+                "clusters": [
+                    {
+                        "id": 410113,
+                        "case_name": "Roe v. Wade",
+                        "date_filed": "1973-01-22",
+                        "absolute_url": "/opinion/108713/roe-v-wade/",
+                        "citations": [{"volume": 410, "reporter": "U.S.", "page": "113"}],
+                    }
+                ],
+            }
+        ]
+
+    monkeypatch.setattr("app.services.authority.courtlistener._post_courtlistener_lookup", fake_lookup)
+
+    response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": "Roe v. Wade, 410 U.S. 113 (1973), held that constitutional privacy protects abortion decisions.",
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["summary"]["total_cited_propositions"] == 1
+    assert payload["summary"]["authority_status_counts"]["authority_matched"] == 1
+    citation = payload["citations"][0]
+    assert citation["authority_status"] == "authority_matched"
+    assert citation["authority_match_status"] == "authority_found"
+    assert citation["authority_lookup_status"] == "authority_found"
+    assert citation["authority_lookup_provider"] == "courtlistener"
+    assert citation["authority_lookup_error"] is None
+    assert citation["authority_lookup_cached"] is False
+    assert citation["matched_authority"]["source_name"] == "courtlistener_citation_lookup"
+    assert citation["matched_authority"]["authority_id"] == "courtlistener-410113"
+    assert citation["external_authority"] == {
+        "provider": "courtlistener",
+        "provider_cluster_id": "410113",
+        "case_name": "Roe v. Wade",
+        "canonical_citation": "410 U.S. 113",
+        "absolute_url": "/opinion/108713/roe-v-wade/",
+        "date_filed": "1973-01-22",
+        "year": 1973,
+        "normalized_citations": ["410 U.S. 113"],
+    }
+    assert citation["authority_content_status"] == "unavailable"
+    assert citation["support_verification_basis"] == "authority_content_unavailable"
+    assert live_call_count == 1
+
+    second_response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": "Roe v. Wade, 410 U.S. 113 (1973), held that constitutional privacy protects abortion decisions.",
+        },
+    )
+
+    assert second_response.status_code == 201
+    second_citation = second_response.json()["citations"][0]
+    assert second_citation["authority_lookup_status"] == "authority_found"
+    assert second_citation["authority_lookup_cached"] is True
+    assert second_citation["external_authority"]["case_name"] == "Roe v. Wade"
+    assert live_call_count == 1
+
+
+def test_citation_verification_endpoint_surfaces_authority_content_available_but_not_supported(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure_provider(monkeypatch, provider=None, api_key=None)
+
+    response = client.post(
+        "/api/v1/citation-verification",
+        json={
+            "draft_text": (
+                "Brown v. Board of Education, 347 U.S. 483 (1954), held that negligence is always enough."
+            ),
+        },
+    )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["summary"]["total_cited_propositions"] == 1
+    assert payload["summary"]["flagged_citation_count"] == 1
+    assert payload["summary"]["verdict_counts"]["unsupported"] == 1
+    assert payload["summary"]["authority_content_status_counts"] == {
+        "not_applicable": 0,
+        "unavailable": 0,
+        "available": 1,
+        "support_verified": 0,
+    }
+    assert payload["citations"][0]["authority_status"] == "authority_matched"
+    assert payload["citations"][0]["authority_content_status"] == "available"
+    assert payload["citations"][0]["support_verification_basis"] == "authority_content_deterministic_no_clear_support"
+    assert payload["citations"][0]["proposition_verdict"] == SupportStatus.UNSUPPORTED.value
+    assert payload["citations"][0]["authority_excerpt"] is not None
+    assert "no excerpt clearly supports" in payload["citations"][0]["reasoning"]
 
 
 def test_citation_verification_endpoint_pairs_multiple_citations_and_summary_counts_align(
@@ -287,7 +435,8 @@ def test_citation_verification_endpoint_pairs_multiple_citations_and_summary_cou
         json={
             "draft_text": (
                 "Brown v. Board of Education, 347 U.S. 483 (1954), held that segregation in public schools "
-                "violates equal protection. Brown v. Davis, 999 U.S. 1 (2001), held that negligence is always enough."
+                "deprives children of equal educational opportunities. "
+                "Anderson v. Liberty Lobby, Inc., 477 U.S. 242 (1986), held that summary judgment always fails when facts are disputed."
             ),
         },
     )
@@ -295,36 +444,39 @@ def test_citation_verification_endpoint_pairs_multiple_citations_and_summary_cou
     assert response.status_code == 201
     payload = response.json()
     assert payload["summary"]["total_cited_propositions"] == 2
-    assert payload["summary"]["flagged_citation_count"] == 2
+    assert payload["summary"]["flagged_citation_count"] == 1
     assert [item["citation_text"] for item in payload["citations"]] == [
         "Brown v. Board of Education, 347 U.S. 483 (1954)",
-        "Brown v. Davis, 999 U.S. 1 (2001)",
+        "Anderson v. Liberty Lobby, Inc., 477 U.S. 242 (1986)",
     ]
-    assert [item["proposition_text"] for item in payload["citations"]] == [
-        (
-            "Brown v. Board of Education, 347 U.S. 483 (1954), held that segregation in public schools "
-            "violates equal protection."
-        ),
-        "Brown v. Davis, 999 U.S. 1 (2001), held that negligence is always enough.",
+    assert [item["proposition_verdict"] for item in payload["citations"]] == [
+        SupportStatus.SUPPORTED.value,
+        SupportStatus.AMBIGUOUS.value,
     ]
-    assert [item["authority_status"] for item in payload["citations"]] == [
-        "authority_matched",
-        "authority_candidate_parsed",
+    assert [item["authority_content_status"] for item in payload["citations"]] == [
+        "support_verified",
+        "unavailable",
     ]
     assert payload["summary"]["authority_status_counts"] == {
-        "authority_unverified": 1,
+        "authority_unverified": 0,
         "citation_recognized": 0,
-        "authority_candidate_parsed": 1,
-        "authority_matched": 1,
+        "authority_candidate_parsed": 0,
+        "authority_matched": 2,
         "linked_authority_support_present": 0,
         "not_reviewed": 0,
     }
+    assert payload["summary"]["authority_content_status_counts"] == {
+        "not_applicable": 0,
+        "unavailable": 1,
+        "available": 0,
+        "support_verified": 1,
+    }
     verdict_total = sum(payload["summary"]["verdict_counts"].values())
-    authority_total = sum(payload["summary"]["authority_status_counts"].values()) - payload["summary"][
-        "authority_status_counts"
-    ]["authority_unverified"]
+    authority_total = sum(payload["summary"]["authority_status_counts"].values()) - payload["summary"]["authority_status_counts"]["authority_unverified"]
+    authority_content_total = sum(payload["summary"]["authority_content_status_counts"].values())
     assert verdict_total == len(payload["citations"])
     assert authority_total == len(payload["citations"])
+    assert authority_content_total == len(payload["citations"])
 
 
 def test_compile_endpoint_returns_structured_compile_output(
@@ -793,6 +945,7 @@ def _configure_provider(
         monkeypatch.setenv("OPENAI_API_KEY", api_key)
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("COURTLISTENER_API_TOKEN", raising=False)
     get_settings.cache_clear()
 
 

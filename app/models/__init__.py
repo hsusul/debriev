@@ -4,6 +4,7 @@ from app.models.draft_review_run import CURRENT_DRAFT_REVIEW_RUN_SNAPSHOT_VERSIO
 from app.models.reextraction_run import CURRENT_REEXTRACTION_RUN_SNAPSHOT_VERSION
 from app.models.verification_run import CURRENT_SUPPORT_SNAPSHOT_VERSION
 from app.models.assertion import Assertion
+from app.models.authority_lookup_cache import AuthorityLookupCacheResult
 from app.models.base import Base
 from app.models.claim_graph_edge import ClaimGraphEdge
 from app.models.claim_unit import ClaimUnit
@@ -21,6 +22,7 @@ from app.models.verification_run import VerificationRun
 
 __all__ = [
     "Assertion",
+    "AuthorityLookupCacheResult",
     "Base",
     "ClaimGraphEdge",
     "ClaimUnit",

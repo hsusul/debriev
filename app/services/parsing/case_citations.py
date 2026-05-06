@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 import re
 
+from app.services.parsing.citation_extraction import CitationCandidate, CitationExtractionService
 from app.services.parsing.normalization import normalize_text
 
 SIGNAL_PREFIX_RE = re.compile(r"^(Under|See|But see|Cf\.)\s+", re.IGNORECASE)
@@ -139,12 +140,12 @@ _AUTHORITY_CATALOG = (
 )
 
 def extract_case_citation_texts(text: str) -> list[str]:
-    """Return distinct case citation strings in encounter order."""
+    """Return distinct full case citation strings in encounter order."""
 
     seen: set[str] = set()
     citations: list[str] = []
-    for match in CASE_CITATION_RE.finditer(text):
-        citation_text = normalize_case_citation_text(match.group(0))
+    for candidate in CitationExtractionService().extract_full_case_citations(text):
+        citation_text = normalize_case_citation_text(candidate.citation_text)
         if citation_text in seen:
             continue
         seen.add(citation_text)
@@ -156,6 +157,10 @@ def parse_case_citation(text: str) -> ParsedCaseCitation:
     """Parse a raw citation string into structured authority fields."""
 
     citation_text = normalize_case_citation_text(text)
+    eyecite_candidate = CitationExtractionService().parse_full_case_citation(citation_text)
+    if eyecite_candidate is not None:
+        return _parsed_case_citation_from_candidate(eyecite_candidate)
+
     match = CASE_CITATION_RE.fullmatch(citation_text)
     if match is None:
         return ParsedCaseCitation(
@@ -182,6 +187,20 @@ def parse_case_citation(text: str) -> ParsedCaseCitation:
         first_page=match.group("page"),
         court=court,
         year=year,
+    )
+
+
+def _parsed_case_citation_from_candidate(candidate: CitationCandidate) -> ParsedCaseCitation:
+    return ParsedCaseCitation(
+        citation_text=normalize_case_citation_text(candidate.citation_text),
+        normalized_citation_text=normalize_case_citation_text(candidate.citation_text),
+        signal=None,
+        case_name=candidate.case_name,
+        reporter_volume=candidate.volume,
+        reporter_abbreviation=_normalize_reporter_abbreviation(candidate.reporter),
+        first_page=candidate.page,
+        court=candidate.court,
+        year=candidate.year,
     )
 
 
